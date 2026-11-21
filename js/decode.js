@@ -35,9 +35,10 @@ class BitmapSource {
 
 // nguồn là mảng điểm ảnh (RAW đã giải mã), 8 hoặc 16 bit, 3 kênh
 class ArraySource {
-  constructor(w, h, data, colors = 3, bits = 8) { this.width = w; this.height = h; this.d = data; this.c = colors; this.bits = bits; }
+  // lut (tuỳ chọn, ảnh 16 bit): 3 x 65536 giá trị 0..255 — đường cong từng kênh (ProRAW khớp theo ảnh Apple nhúng)
+  constructor(w, h, data, colors = 3, bits = 8, lut = null) { this.width = w; this.height = h; this.d = data; this.c = colors; this.bits = bits; this.lut = lut; }
   region(sx, sy, sw, sh, tw, th) {
-    const out = new Uint8ClampedArray(tw * th * 4), d = this.d, C = this.c, W = this.width;
+    const out = new Uint8ClampedArray(tw * th * 4), d = this.d, C = this.c, W = this.width, L = this.lut;
     const k = this.bits > 8 ? 255 / 65535 : 1;
     const fx = sw / tw, fy = sh / th;
     for (let y = 0; y < th; y++) {
@@ -45,6 +46,15 @@ class ArraySource {
       for (let x = 0; x < tw; x++) {
         const x0 = sx + Math.floor(x * fx), x1 = Math.max(x0 + 1, sx + Math.floor((x + 1) * fx));
         let r = 0, g = 0, b = 0, n = 0;
+        if (L) {
+          // qua đường cong TỪNG điểm rồi mới lấy trung bình (giống bản máy tính: áp đường cong rồi thu nhỏ)
+          for (let yy = y0; yy < y1; yy++) for (let xx = x0; xx < x1; xx++) {
+            const i = (yy * W + xx) * C; r += L[d[i]]; g += L[65536 + d[i + 1]]; b += L[131072 + d[i + 2]]; n++;
+          }
+          const o = (y * tw + x) * 4;
+          out[o] = r / n; out[o + 1] = g / n; out[o + 2] = b / n; out[o + 3] = 255;     // Uint8ClampedArray tự làm tròn
+          continue;
+        }
         for (let yy = y0; yy < y1; yy++) for (let xx = x0; xx < x1; xx++) {
           const i = (yy * W + xx) * C; r += d[i]; g += d[i + 1]; b += d[i + 2]; n++;
         }
@@ -70,8 +80,66 @@ async function bitmapOf(blob) {
   } finally { URL.revokeObjectURL(url); }
 }
 
-// dự phòng: ảnh JPEG lớn nhất nhúng trong tệp RAW
+// Các ảnh JPEG thường (không phải mảnh dữ liệu RAW nén lossless) nhúng trong tệp, kèm cỡ đọc từ khung SOF:
+// [{ st, w, h }], lớn trước. ProRAW nén dữ liệu RAW thành nhiều mảnh JPEG lossless (SOF3): bỏ qua.
+function embeddedJpegs(buf) {
+  const out = [];
+  for (let i = 0; i + 4 < buf.length; i++) {
+    if (buf[i] !== 0xFF || buf[i + 1] !== 0xD8 || buf[i + 2] !== 0xFF) continue;
+    let p = i + 2, info = null;
+    for (let guard = 0; guard < 64 && p + 9 < buf.length; guard++) {
+      if (buf[p] !== 0xFF) break;
+      const mk = buf[p + 1];
+      if (mk === 0xD8 || (mk >= 0xD0 && mk <= 0xD7) || mk === 0x01) { p += 2; continue; }
+      const len = (buf[p + 2] << 8) | buf[p + 3];
+      if (mk >= 0xC0 && mk <= 0xCF && mk !== 0xC4 && mk !== 0xC8 && mk !== 0xCC) {
+        if (mk !== 0xC3 && mk !== 0xC7 && mk !== 0xCB && mk !== 0xCF) info = { st: i, h: (buf[p + 5] << 8) | buf[p + 6], w: (buf[p + 7] << 8) | buf[p + 8] };
+        break;
+      }
+      if (len < 2) break;
+      p += 2 + len;
+    }
+    if (info && info.w > 0 && info.h > 0) { out.push(info); i = p; }
+  }
+  return out.sort((a, b) => b.w * b.h - a.w * a.h);
+}
+
+// ảnh JPEG lớn nhất nhúng trong tệp RAW (ImageBitmap)
 async function rawEmbedded(buf) {
+  for (const c of embeddedJpegs(buf).slice(0, 4)) {
+    try { return await bitmapOf(new Blob([buf.subarray(c.st)], { type: 'image/jpeg' })); } catch (e) { /* thử ảnh kế */ }
+  }
+  return rawEmbeddedOld(buf);
+}
+
+// Đường cong TỪNG KÊNH để phân bố sáng / màu của ảnh RAW (16 bit) khớp ảnh mẫu (JPEG Apple đã chỉnh, 8 bit) —
+// khớp histogram (cùng công thức với engine._match_lut của PUM máy tính).
+// src: Uint16Array RGB w x h (lấy mẫu hàng chẵn, cột chẵn); ref: RGBA 8 bit (mọi điểm). Trả Float32Array 3 x 65536 (0..255).
+export function matchLut(src, w, h, ref) {
+  const lut = new Float32Array(3 * 65536);
+  for (let c = 0; c < 3; c++) {
+    const hs = new Float64Array(65536), hr = new Float64Array(256);
+    let ns = 0, nr = 0;
+    for (let y = 0; y < h; y += 2) for (let x = 0; x < w; x += 2) { hs[src[(y * w + x) * 3 + c]]++; ns++; }
+    for (let i = c; i < ref.length; i += 4) { hr[ref[i]]++; nr++; }
+    const cr = new Float64Array(256);
+    let a = 0;
+    for (let j = 0; j < 256; j++) { a += hr[j]; cr[j] = a / nr; }
+    let cum = 0, j = 0;
+    for (let v = 0; v < 65536; v++) {
+      cum += hs[v];
+      const p = (cum - hs[v] / 2) / ns;          // phân vị giữa mức v
+      while (j < 255 && cr[j] < p) j++;
+      const lo = j > 0 ? cr[j - 1] : 0, hi = cr[j];
+      const t = hi > lo ? (p - lo) / (hi - lo) : 1;
+      lut[c * 65536 + v] = Math.min(255, Math.max(0, j - 1 + Math.min(1, Math.max(0, t))));
+    }
+  }
+  return lut;
+}
+
+// dự phòng cũ: ảnh JPEG lớn nhất nhúng trong tệp RAW (thử giải mã từng chỗ bắt đầu JPEG)
+async function rawEmbeddedOld(buf) {
   const cands = [];
   for (let i = 0; i < buf.length - 3; i++) if (buf[i] === 0xFF && buf[i + 1] === 0xD8 && buf[i + 2] === 0xFF) { cands.push(i); i += 1000; }
   let best = null;
@@ -135,38 +203,47 @@ export function tiffInfo(buf) {
 let LibRawMod = null;
 async function decodeRaw(blob) {
   const buf = new Uint8Array(await blob.arrayBuffer());
-  // Ảnh RAW của iPhone (Apple ProRAW, .DNG): dùng bộ giải mã của Apple (Safari), như app Ảnh.
-  // - ProRAW ghi kèm độ phơi sáng gốc + đường cong tông / bản đồ sáng của Apple.
-  // - LibRaw bỏ qua phần đó nên ảnh ra tối gần một nửa (người dùng đo trên iPhone: 70 so với 136).
-  // - RAW máy ảnh (Sony ARW...) vẫn giải mã bằng LibRaw như PUM máy tính.
-  // - Safari chỉ trả ảnh nhỏ (không đủ cỡ) thì cũng dùng LibRaw.
+  // Ảnh RAW của iPhone (Apple ProRAW, .DNG): LibRaw bỏ qua độ phơi sáng gốc + đường cong tông / bản đồ sáng của Apple
+  // nên ảnh ra tối gần một nửa (đo trên iPhone của người dùng: 70 so với 136 của app Ảnh). Cách làm, giống hệt
+  // engine._decode_raw của PUM máy tính:
+  // - vẫn giải mã RAW bằng LibRaw (đủ cỡ, 16 bit);
+  // - rồi qua đường cong TỪNG kênh khớp phân bố sáng / màu của ảnh JPEG Apple đã chỉnh nhúng trong tệp;
+  // - không có ảnh nhúng thì bù độ phơi sáng gốc (BaselineExposure).
+  // RAW máy ảnh (Sony ARW, DJI DNG...) giải mã bằng LibRaw như cũ.
   const ti = tiffInfo(buf);
-  if (ti.dng && /^apple/i.test(ti.make)) {
+  const apple = ti.dng && /^apple/i.test(ti.make);
+  let ref = null;
+  if (apple) {
     try {
-      const bmp = await createImageBitmap(blob, { imageOrientation: 'from-image' });
-      const want = Math.max(ti.w, ti.h);
-      if (!want || Math.max(bmp.width, bmp.height) >= 0.9 * want) return { src: new BitmapSource(bmp), raw: true, apple: true };
-      bmp.close();
-    } catch (e) { /* Safari không giải mã được: dùng LibRaw */ }
+      const bm = await rawEmbedded(buf);
+      const c = mkCanvas(bm.width, bm.height), x = c.getContext('2d', { willReadFrequently: true });
+      x.drawImage(bm, 0, 0);
+      ref = x.getImageData(0, 0, bm.width, bm.height).data;
+      bm.close && bm.close(); c.width = 0; c.height = 0;
+    } catch (e) { ref = null; }
   }
   try {
     if (!LibRawMod) LibRawMod = (await import('../vendor/libraw-wasm-1.6.0/index.js')).default;
     const raw = new LibRawMod();
     try {
-      // giống rawpy.postprocess(use_camera_wb=True) của PUM máy tính. ProRAW (Safari không giải mã đủ cỡ): bù độ
-      // phơi sáng gốc như engine._decode_raw (exp_shift = 2^BaselineExposure, giữ vùng sáng 0,8)
+      // giống rawpy.postprocess(use_camera_wb=True) của PUM máy tính; ProRAW không có ảnh nhúng: bù phơi sáng gốc
+      // như engine._decode_raw (exp_shift = 2^BaselineExposure, giữ vùng sáng 0,8)
       const opt = { useCameraWb: true, userQual: 3, outputBps: 16, outputColor: 1 };
-      if (ti.dng && /^apple/i.test(ti.make)) Object.assign(opt, { expCorrec: 1, expShift: Math.min(8, Math.max(0.25, 2 ** (ti.baselineExposure || 0))), expPreser: 0.8 });
+      if (apple && !ref) Object.assign(opt, { expCorrec: 1, expShift: Math.min(8, Math.max(0.25, 2 ** (ti.baselineExposure || 0))), expPreser: 0.8 });
       await raw.open(buf.slice(), opt);
       const im = await raw.imageData();
       if (!im || !im.data) throw new Error('LibRaw không trả ảnh');
-      return { src: new ArraySource(im.width, im.height, im.data, im.colors || 3, im.bits || 16), raw: true, libraw: true };
+      const lut = ref && (im.bits || 16) > 8 ? matchLut(im.data, im.width, im.height, ref) : null;
+      return { src: new ArraySource(im.width, im.height, im.data, im.colors || 3, im.bits || 16, lut), raw: true, libraw: true, apple, appleLut: !!lut };
     } finally { raw.dispose(); }
   } catch (e) {
     console.warn('LibRaw lỗi, dùng ảnh xem trước nhúng:', e);
     return { src: new BitmapSource(await rawEmbedded(buf)), rawPreview: true };
   }
 }
+
+// cho bài kiểm tra (kiemtra/doi_chieu_proraw.py)
+export const _t = { rawEmbedded, embeddedJpegs, ArraySource, matchLut };
 
 // nhanh (cho thumbnail khi nhập): RAW dùng ảnh JPEG nhúng
 export async function decodeQuick(blob, name) {

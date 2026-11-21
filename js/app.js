@@ -202,7 +202,8 @@ class App {
       if (myOpen !== this._open) { dec.src.close && dec.src.close(); return; }
       if (this.bitmap && this.bitmap.close) this.bitmap.close();
       this.bitmap = dec.src;
-      this.decWay = dec.apple ? 'Apple (Safari) — ảnh ProRAW của iPhone' : dec.libraw ? 'LibRaw (như PUM máy tính)' : dec.rawPreview ? 'ảnh xem trước nhúng trong RAW' : 'Safari';
+      this.decWay = dec.appleLut ? 'LibRaw + khớp theo ảnh Apple nhúng (ProRAW của iPhone)' : dec.apple ? 'LibRaw + bù phơi sáng gốc (ProRAW, không thấy ảnh nhúng)'
+        : dec.libraw ? 'LibRaw (như PUM máy tính)' : dec.rawPreview ? 'ảnh xem trước nhúng trong RAW' : 'Safari';
       this.cur = p;
       this.fullW = dec.src.width; this.fullH = dec.src.height;
       const k = Math.min(1, PREVIEW_SIDE / Math.max(this.fullW, this.fullH));
