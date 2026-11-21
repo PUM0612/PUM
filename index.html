@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#1b1b1d">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="PUM">
+<title>PUM</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+<div id="app">
+  <header id="topbar">
+    <button class="tb" id="btnMenu" aria-label="Menu">☰</button>
+    <div id="title">PUM</div>
+    <button class="tb" id="btnUndo" aria-label="Hoàn tác">↶</button>
+    <button class="tb" id="btnRedo" aria-label="Làm lại">↷</button>
+    <button class="tb" id="btnCompare" aria-label="Trước / sau">◐</button>
+    <button class="tb accent" id="btnExport" aria-label="Xuất ảnh">⇪</button>
+  </header>
+  <main id="viewer">
+    <div id="stage"><canvas id="cv"></canvas><canvas id="hi"></canvas><canvas id="ov"></canvas></div>
+    <div id="empty">
+      <div class="logo">PUM</div>
+      <p>Chạm <b>Mở ảnh</b> để chọn ảnh từ Ảnh hoặc Tệp (JPG, HEIC, PNG).</p>
+      <button class="big" id="btnOpen2">Mở ảnh</button>
+    </div>
+    <div id="badge"></div>
+    <div id="toast"></div>
+    <div id="busy"><div class="spin"></div></div>
+  </main>
+  <div id="strip"></div>
+  <section id="panel">
+    <nav id="tabs"></nav>
+    <div id="pane"></div>
+  </section>
+</div>
+<div id="sheet" class="hidden"><div class="sheet-card"><div class="sheet-head"><b id="sheetTitle"></b><button id="sheetClose" class="tb">✕</button></div><div id="sheetBody"></div></div></div>
+<input type="file" id="file" multiple accept="image/*,.heic,.heif,.jpg,.jpeg,.png,.webp,.dng,.arw,.cr2,.cr3,.nef,.raf,.orf,.rw2" hidden>
+<input type="file" id="fileJson" accept=".json,application/json" hidden>
+<input type="file" id="fileLogo" accept="image/*" hidden>
+<script type="module" src="js/app.js"></script>
+</body>
+</html>

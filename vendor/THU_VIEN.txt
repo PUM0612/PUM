@@ -1,0 +1,6 @@
+﻿# Thư viện bên ngoài (chép nguyên bản, chạy offline)
+- libraw-wasm-1.6.0/ — npm libraw-wasm@1.6.0 (giấy phép ISC; LibRaw: LGPL 2.1 / CDDL), tải từ registry.npmjs.org.
+  Dùng: index.js, worker.js, libraw.js, libraw.wasm (thư mục dist của gói).
+- mediapipe-tasks-vision-1.2.3/ — npm @mediapipe/tasks-vision@1.2.3 (Apache-2.0), tải từ registry.npmjs.org.
+  Dùng: vision_bundle.mjs, wasm/vision_wasm_internal.js, wasm/vision_wasm_internal.wasm.
+Mô hình AI (models/): face_landmarker.task, pose_landmarker_full.task — chép từ "PUM Mã Nguồn/models" (giống bản máy tính).
