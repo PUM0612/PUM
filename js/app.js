@@ -99,6 +99,10 @@ class App {
     $('title').onclick = () => this.openLibrary();
     $('sheetClose').onclick = () => this.closeSheet();
     $('sheet').addEventListener('click', (e) => { if (e.target.id === 'sheet') this.closeSheet(); });
+    // lưu ngay khi app bị ẩn / đóng (vuốt thoát, chuyển app) — không đợi hẹn giờ lưu
+    const flush = () => { clearTimeout(this._sv); this.saveCurrent(); };
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flush(); });
+    window.addEventListener('pagehide', flush);
     window.addEventListener('keydown', (e) => {
       if (e.target.tagName === 'INPUT') return;
       if ((e.ctrlKey || e.metaKey) && e.key === 'z') { e.preventDefault(); e.shiftKey ? this.redo() : this.undo(); }
@@ -223,7 +227,7 @@ class App {
       await this.saveCurrent();
       this.updateThumb();
       this.renderStrip();
-    }, 700);
+    }, 400);
   }
   async updateThumb() {
     if (!this.cur || !this.viewer.img || this.tool === 'crop') return;
