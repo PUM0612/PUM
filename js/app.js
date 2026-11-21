@@ -5,12 +5,28 @@ import { Viewer, drawCropOverlay, dragCrop, rectForRatio } from './ui/viewer.js'
 import { h, btn, hint, Slider, toggle, select } from './ui/controls.js';
 import * as S from './engine/settings.js';
 import * as E from './engine/engine.js';
-import { VERSION, BUILD_DATE } from './version.js';
+import { VERSION, BUILD_DATE, NOTES } from './version.js';
 import { openExportSheet } from './ui/export_ui.js';
 import { decodeFile, decodeQuick, isRawName } from './decode.js';
 import { portraitActive, faceBoxes } from './engine/portrait.js';
+import { XoaAI, MODEL_BYTES } from './xoa_ai.js';
 
 const PREVIEW_SIDE = 1600, DRAFT_SIDE = 640, THUMB = 240;
+const XV_VARIANTS = 4;          // số cách lấp của Xoá vật thể AI (xoa_vat.js VARIANTS)
+// Đặt lại nhiều mức (main.py GEOM_KEYS / RESET_KINDS) + khoá của từng tab (panels.reset_tab)
+const GEOM_KEYS = ['rotate', 'straighten', 'crop', 'crop_rect', 'flip', 'lens', 'crop_outside'];
+const RESET_KINDS = { all: 'Đặt lại toàn bộ', color_tone: 'Đặt lại màu & tông', geometry: 'Đặt lại khung cắt / xoay / ống kính',
+  retouch: 'Xoá retouch', portrait: 'Đặt lại chân dung', layers: 'Xoá mọi layer' };
+const TAB_KEYS = {
+  basic: ['temp', 'tint', 'vibrance', 'saturation', 'exposure', 'contrast', 'brightness', 'highlights', 'shadows', 'whites', 'blacks',
+    'texture', 'clarity', 'dehaze'],
+  color: ['color', 'color_adv', 'skin', 'calib'], grading: ['grading'], curve: ['curve'],
+  detail: ['sharpen', 'sharpen_radius', 'nr_lum', 'nr_lum_detail', 'nr_lum_contrast', 'nr_color', 'nr_color_detail', 'nr_color_smooth',
+    'vignette', 'grain', 'grain_size'],
+  lens: GEOM_KEYS, layer: ['layers'], retouch: [], portrait: [],
+};
+const TABS_LABEL = { basic: 'Cơ bản', color: 'Màu', grading: 'Grading', curve: 'Curve', detail: 'Chi tiết', lens: 'Khung', layer: 'Layer',
+  retouch: 'Retouch', portrait: 'Chân dung' };
 const $ = (id) => document.getElementById(id);
 const deep = S.deepCopy;
 const J = JSON.stringify;
@@ -39,6 +55,7 @@ class App {
     this.worker = new Worker(new URL('./workers/render.worker.js', import.meta.url), { type: 'module' });
     this.worker.onmessage = (e) => this.onWorker(e.data);
     this.worker.onerror = (e) => this.toast('Lỗi luồng dựng ảnh: ' + (e.message || e));
+    this.ai = new XoaAI();          // mô hình AI Xoá vật thể (tải khi người dùng đồng ý)
     this.viewer = new Viewer(this);
     this.panels = new Panels(this);
     this.bindUi();
@@ -54,7 +71,8 @@ class App {
     });
   }
   onWorker(m) {
-    if (m.type && (m.type.startsWith('export_') || m.type === 'roi_done')) { const f = this.jobs.get(m.job); if (f) f(m); return; }
+    if (m.type === 'xv_run' || m.type === 'xv_get' || m.type === 'xv_put' || m.type === 'xv_progress') { this.xvMsg(m); return; }
+    if (m.type && (m.type.startsWith('export_') || m.type === 'roi_done' || m.type === 'xv_done')) { const f = this.jobs.get(m.job); if (f) f(m); return; }
     const p = this.pending.get(m.req);
     if (!p) return;
     this.pending.delete(m.req);
@@ -64,6 +82,7 @@ class App {
   // ----------------------------------------------------------------- khởi động
   async init() {
     store.persist();
+    await this.xvSync();            // có mô hình AI xoá vật thể trên máy chưa (báo cho luồng dựng)
     try {
       this.photos = (await store.photos()) || [];
       this.photos.sort((a, b) => a.added - b.added);
@@ -191,7 +210,7 @@ class App {
       this.pw = pw; this.ph = ph;
       this.baseRGBA = rgba.slice();           // giữ bản sao cho AI (tách người / khuôn mặt)
       this.personFor = null; this.facesFor = null; this.faces = null;
-      await this.call('base', { id: p.id, rgba, w: pw, h: ph, fullW: this.fullW, fullH: this.fullH, draftSide: DRAFT_SIDE }, [rgba.buffer]);
+      await this.call('base', { id: p.id, rgba, w: pw, h: ph, fullW: this.fullW, fullH: this.fullH, draftSide: DRAFT_SIDE, photo: photoKey(p) }, [rgba.buffer]);
       this.openMs = performance.now() - t0;
       this.s = S.mergeSettings(p.settings);
       if (!this.histories.has(p.id)) this.histories.set(p.id, { stack: [{ label: 'Mở ảnh', s: J(this.s) }], idx: 0 });
@@ -285,6 +304,29 @@ class App {
     this.end();
   }
   refresh() { this.panels.sync(); this.updateUndo(); this.drawOverlay(); }
+  // Color Editor nâng cao: thêm / xoá dải màu (panels.add_color_range / remove_color_range)
+  addColorRange(hue, sat) {
+    if (!this.cur) return;
+    this.begin('Thêm dải màu');
+    const rs = (this.s.color_adv || []).concat([E.newColorRange(hue, sat)]);
+    this.set(['color_adv'], rs);
+    this.panels.cadv = rs.length - 1;
+    this.end();
+  }
+  removeColorRange() {
+    const rs = this.s.color_adv || [], i = this.panels.cadv;
+    if (!(i >= 0 && i < rs.length)) return;
+    this.begin('Xoá dải màu');
+    this.set(['color_adv'], rs.filter((_, k) => k !== i));
+    this.panels.cadv = Math.min(i, rs.length - 2);
+    this.end();
+  }
+  // thông số gửi đi dựng: thêm khoá tạm "xem vùng chọn" của dải màu (không lưu vào ảnh)
+  renderSettings() {
+    const s = deep(this.s), k = this.panels && this.panels.cadvShowIndex();
+    if (k !== null && k !== undefined) s._cadv_show = k;
+    return s;
+  }
 
   // ----------------------------------------------------------------- lịch sử
   H() { return this.cur ? this.histories.get(this.cur.id) : null; }
@@ -318,7 +360,7 @@ class App {
   requestRender(draft, fresh) {
     if (!this.cur) return;
     if ($('hi').style.display !== 'none') this.hideHi();
-    this.want = { draft, s: deep(this.s), geom: this.tool === 'crop' ? 'nocrop' : true, fresh, mask: this.showMask ? this.layerIdx : -1 };
+    this.want = { draft, s: this.renderSettings(), geom: this.tool === 'crop' ? 'nocrop' : true, fresh, mask: this.showMask ? this.layerIdx : -1 };
     this.pump();
   }
   async pump() {
@@ -338,6 +380,7 @@ class App {
         if (r.hist && this.panels.cur === 'curve') this.panels.curve.draw();
         if (this.panels.cur === 'scopes' && (r.hist || !this._scT || performance.now() - this._scT > 120)) { this._scT = performance.now(); this.panels.scopes.draw(this.viewer.img); }
         if (!w.draft) this.scheduleHiRes();
+        if (!w.draft && r.xvPending) this.xvKick();        // có vùng xoá vật thể chưa có kết quả AI: chạy AI
         if (!w.draft && this.panels.cur === 's_auto') setTimeout(() => this.styleThumbs(), 50);
         if (w.fresh) this.viewer.fitView(), this.viewer.apply();
       }
@@ -373,7 +416,7 @@ class App {
     let ds = Math.min(1, v.z * dpr / F);
     const area = (x1 - x0) * F * ds * (y1 - y0) * F * ds;
     if (area > 6e6) ds *= Math.sqrt(6e6 / area);
-    const sJ = J(this.s);
+    const sJ = J(this.renderSettings());
     const key = J([sJ, Math.round(x0), Math.round(y0), Math.round(x1), Math.round(y1), ds.toFixed(3)]);
     if (key === this._hiKey && hi.style.display !== 'none') return;
     if (this._hiBusy) { this._hiAgain = true; return; }
@@ -387,10 +430,10 @@ class App {
         } else if (m.type === 'roi_done') { this.jobs.delete(job); resolve(m); }
       });
       this.worker.postMessage({ type: 'roi_start', job, id: this.cur.id, settings: JSON.parse(sJ), W: this.fullW, H: this.fullH,
-        rect: [x0 * F, y0 * F, x1 * F, y1 * F], ds });
+        rect: [x0 * F, y0 * F, x1 * F, y1 * F], ds, photo: photoKey(this.cur) });
     });
     this._hiBusy = false;
-    if (!res.error && ver === this._hiVer && J(this.s) === sJ && !v.holding && this.lastWhich === 'full') {
+    if (!res.error && ver === this._hiVer && J(this.renderSettings()) === sJ && !v.holding && this.lastWhich === 'full') {
       hi.width = res.w; hi.height = res.h;
       hi.getContext('2d').putImageData(new ImageData(res.rgba, res.w, res.h), 0, 0);
       const k = 1 / (res.ds * F);
@@ -416,6 +459,7 @@ class App {
     }
     if (prev === 'crop' || t === 'crop') { this.requestRender(false); if (prev === 'crop') { this.pushHistory('Cắt khung'); this.saveSoon(); } }
     const msg = { wb: 'Chạm vào vùng trắng / xám trên ảnh để cân bằng trắng', colorpick: 'Chạm lên ảnh để chọn dải màu cần chỉnh',
+      cadvpick: 'Chạm lên màu cần sửa trên ảnh để tạo dải màu mới',
       crange: 'Chạm lên ảnh để chọn màu cho Color Range', level: 'Kéo một đường dọc theo chân trời hoặc cạnh lẽ ra phải thẳng',
       kguide: 'Kẻ dọc theo các cạnh lẽ ra thẳng đứng (tường, cột) và / hoặc nằm ngang, rồi bấm Áp dụng',
       lbrush: 'Tô lên ảnh bằng 1 ngón tay (2 ngón để phóng / di chuyển)', lerase: 'Tô để bỏ vùng khỏi mask',
@@ -425,8 +469,127 @@ class App {
       skin: 'Tô lên vùng da cần làm mịn', erase: 'Tô để bỏ làm mịn (mắt, môi, tóc...)',
       pprotect: 'Tô lên vùng không muốn bị chỉnh (nốt ruồi duyên, hình xăm, trang sức...)', perase: 'Tô để bỏ vùng bảo vệ' }[t];
     if (msg) this.toast(msg, 3000);
+    if (t === 'remove') {
+      // Xoá vật thể dùng AI như PUM máy tính: chưa có mô hình thì mời tải; có rồi thì nạp sẵn ở nền trong lúc tô
+      if (this.ai.state === 'ready') this.xvIsolated().then((ok) => ok && this.ai.warm().catch(() => {}));
+      else if (this.ai.state === 'none' && !this._aiAsked) { this._aiAsked = true; this.offerAI(); }
+    }
     this.panels.sync();
     this.drawOverlay();
+  }
+
+  // ----------------------------------------------------------------- Xoá vật thể bằng AI
+  xvReady() { return this.ai.state === 'ready'; }
+  // AI cần trang "cô lập" (service worker gắn COOP / COEP). Lần mở đầu tiên service worker mới cài nên trang chưa
+  // cô lập: luồng AI tạo lúc đó không nạp được thư viện -> khởi động lại app một lần (thông số đã lưu ngay).
+  async xvIsolated() {
+    if (self.crossOriginIsolated || !navigator.serviceWorker || !navigator.serviceWorker.controller) return true;
+    let done = false;
+    try { done = sessionStorage.getItem('pum_coi_reload') === '1'; sessionStorage.setItem('pum_coi_reload', '1'); } catch (e) { done = true; }
+    if (done) return true;           // đã thử khởi động lại mà vẫn không cô lập: chạy AI 1 luồng
+    this.toast('PUM khởi động lại để bật AI xoá vật thể…', 3000);
+    await this.saveCurrent();
+    setTimeout(() => location.reload(), 300);
+    return false;
+  }
+  async xvSync() {
+    await this.ai.check();
+    await this.call('xv_state', { ai: this.ai.state === 'ready' }).catch(() => {});
+  }
+  // việc AI mà luồng dựng nhờ: chạy mô hình, đọc / lưu kết quả đã tính (IndexedDB, mở lại app không phải chạy lại)
+  async xvMsg(m) {
+    if (m.type === 'xv_get') {
+      let entry = null;
+      try { entry = (await store.get('xv:' + m.key)) || null; } catch (e) { /* bỏ qua */ }
+      this.worker.postMessage({ type: 'xv_got', job: m.job, entry });
+    } else if (m.type === 'xv_put') {
+      try {
+        await store.set('xv:' + m.key, m.entry);
+        const keys = ((await store.get('xv_keys')) || []).filter((k) => k !== m.key);
+        keys.push(m.key);
+        while (keys.length > 120) await store.del('xv:' + keys.shift());      // giữ ~120 vùng gần nhất (~1,5 MB mỗi ô)
+        await store.set('xv_keys', keys);
+      } catch (e) { /* hết chỗ: chỉ giữ trong bộ nhớ */ }
+    } else if (m.type === 'xv_progress') {
+      this.toast(this.ai.loaded ? 'AI đang xoá vật thể, dựng lại nền phía sau…' : 'Đang nạp AI xoá vật thể (lần đầu hơi lâu)…', 60000);
+    } else if (m.type === 'xv_run') {
+      try {
+        const L = await this.ai.run(m.inp, m.m);
+        this.worker.postMessage({ type: 'xv_ai', job: m.job, L }, [L.buffer]);
+      } catch (e) {
+        this.worker.postMessage({ type: 'xv_ai', job: m.job, error: e.message });
+      }
+    }
+  }
+  // ảnh đang mở có vùng xoá chưa có kết quả AI: chạy AI rồi dựng lại
+  async xvKick() {
+    if (!this.cur || !this.xvReady()) return;
+    const sJ = J(this.s.retouch);
+    if (this._xvRun) { this._xvAgain = true; return; }
+    if (this._xvFail === sJ) return;           // vừa lỗi với đúng các vùng này: không chạy lặp
+    this._xvRun = true;
+    if (!(await this.xvIsolated())) { this._xvRun = false; return; }
+    const id = this.cur.id, bitmap = this.bitmap, job = 'x' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    const t0 = performance.now();
+    this.busy(true);
+    let r = null;
+    try {
+      r = await new Promise((resolve) => {
+        this.jobs.set(job, (m) => {
+          if (m.type === 'export_src') {
+            const rgba = drawScaled(bitmap, ...m.rect, m.tw, m.th);
+            this.worker.postMessage({ type: 'export_band', job, rgba }, [rgba.buffer]);
+          } else if (m.type === 'xv_done') { this.jobs.delete(job); resolve(m); }
+        });
+        this.worker.postMessage({ type: 'xv_prepare', job, id, settings: deep(this.s), W: this.fullW, H: this.fullH, photo: photoKey(this.cur) });
+      });
+    } finally { this.busy(false); this._xvRun = false; }
+    this.xvMs = performance.now() - t0;
+    if (r && r.error) {
+      this._xvFail = sJ;
+      console.error(r.error);
+      this.toast('Không xoá được bằng AI: ' + r.error.split('\n')[0], 6000);
+    } else if (r && r.n) this.toast('Đã xoá vật thể (AI dựng lại nền)', 1800);
+    if (this.cur && this.cur.id === id) { this._hiKey = null; this.requestRender(false); }
+    if (this._xvAgain) { this._xvAgain = false; }
+  }
+  // mời tải mô hình AI (lần đầu dùng Xoá vật thể)
+  offerAI(after) {
+    const mb = Math.round(MODEL_BYTES / 1e6);
+    const prog = h('div', { class: 'prog' }, h('div')), status = h('div', { class: 'hint' });
+    const go = h('button', { class: 'big', style: 'width:100%;margin-top:10px' }, `Tải mô hình AI (${mb} MB)`);
+    go.onclick = async () => {
+      go.disabled = true; status.textContent = 'Đang tải…';
+      try {
+        await this.ai.download((d, tot) => { prog.firstChild.style.width = (d / tot * 100).toFixed(1) + '%'; status.textContent = `Đang tải ${(d / 1e6).toFixed(0)} / ${(tot / 1e6).toFixed(0)} MB…`; });
+        status.textContent = 'Đã tải xong. Đang nạp AI…';
+        await this.xvSync();
+        this.closeSheet();
+        this.toast('Đã có AI xoá vật thể trên máy — dùng được cả khi không có mạng', 3500);
+        if (!(await this.xvIsolated())) return;
+        this.ai.warm().catch(() => {});
+        this.requestRender(false);
+        if (after) after();
+      } catch (e) {
+        go.disabled = false; go.textContent = 'Thử tải lại (tải tiếp phần còn thiếu)';
+        status.textContent = 'Chưa tải xong: ' + e.message;
+      }
+    };
+    this.openSheet('Xoá vật thể bằng AI', h('div', {},
+      h('div', {}, 'PUM xoá hẳn vật rồi để AI dựng lại phần nền phía sau (giống PUM máy tính) — không chép mảng ảnh chỗ khác sang.'),
+      h('div', { style: 'margin-top:8px' }, `Cần tải mô hình AI một lần (${mb} MB, nên dùng Wi-Fi). Tải xong, mô hình nằm trong bộ nhớ của app và chạy cả khi không có mạng.`),
+      go, prog, status,
+      btn('Để sau', () => { this.closeSheet(); this.toast('Chưa có mô hình AI: vùng xoá được lấp tạm từ nền xung quanh', 4000); }),
+      hint('Xoá mô hình để lấy lại chỗ trống: menu ☰ › Mô hình AI xoá vật thể.')));
+  }
+  aiMenu() {
+    const ready = this.xvReady(), info = this.ai.info || {};
+    this.openSheet('Mô hình AI xoá vật thể', h('div', { class: 'menu' },
+      h('div', { style: 'margin-bottom:8px' }, ready ? `Đã có trên máy (${Math.round(MODEL_BYTES / 1e6)} MB).` + (info.loadMs ? ` Nạp ${(info.loadMs / 1000).toFixed(1)} giây, ${info.threads} luồng.` : '') + (info.lastMs ? ` Lần chạy gần nhất ${(info.lastMs / 1000).toFixed(1)} giây / ô.` : '') : 'Chưa tải.'),
+      ready ? btn('🗑 Xoá mô hình khỏi máy (lấy lại chỗ trống)', async () => {
+        if (!confirm('Xoá mô hình AI khỏi PUM? Các vùng xoá vật thể sẽ được lấp tạm từ nền xung quanh cho tới khi tải lại.')) return;
+        await this.ai.removeModel(); await this.xvSync(); this.closeSheet(); this.requestRender(false);
+      }) : btn(`⬇️ Tải mô hình (${Math.round(MODEL_BYTES / 1e6)} MB)`, () => this.offerAI())));
   }
   // ánh xạ: điểm ảnh hiển thị <-> toạ độ chuẩn hoá trên ảnh nguồn
   geo() {
@@ -460,6 +623,21 @@ class App {
         this.toast(`Cân bằng trắng: nhiệt độ ${tp.toFixed(0)}, tint ${tn.toFixed(0)}`);
       });
       this.setTool(null);
+      return true;
+    }
+    if (t === 'cadvpick') {
+      // trung bình ô 7x7 quanh chỗ chạm trên ảnh đang hiển thị (như bản máy tính) -> sắc độ / bão hoà OkLCh
+      const im = this.viewer.img, x = Math.round(Math.min(vw - 1, Math.max(0, p[0]))), y = Math.round(Math.min(vh - 1, Math.max(0, p[1])));
+      const px = [0, 0, 0]; let cnt = 0;
+      for (let yy = Math.max(0, y - 3); yy <= Math.min(im.height - 1, y + 3); yy++)
+        for (let xx = Math.max(0, x - 3); xx <= Math.min(im.width - 1, x + 3); xx++) {
+          const i = (yy * im.width + xx) * 4;
+          px[0] += im.data[i]; px[1] += im.data[i + 1]; px[2] += im.data[i + 2]; cnt++;
+        }
+      const [hh, cc] = E.oklchOf(px.map((v) => v / cnt / 255));
+      this.addColorRange(hh, cc);
+      this.setTool(null);
+      this.toast(`Đã tạo dải màu mới quanh ${hh.toFixed(0)}° (bão hoà ${cc.toFixed(0)}%) — kéo Sắc độ / Bão hoà / Độ sáng để chỉnh`, 3500);
       return true;
     }
     if (t === 'colorpick' || t === 'crange') {
@@ -586,7 +764,11 @@ class App {
   // ----------------------------------------------------------------- retouch trên ảnh
   rtSel() {
     const rt = this.s.retouch;
-    if (this.selArea >= 0 && rt.areas[this.selArea]) { const a = rt.areas[this.selArea]; return { kind: 'area', i: this.selArea, o: a, label: ({ heal: 'Heal', clone: 'Clone', remove: 'Xoá vật thể' }[a.kind] || 'Vùng') + ' #' + (this.selArea + 1) }; }
+    if (this.selArea >= 0 && rt.areas[this.selArea]) {
+      const a = rt.areas[this.selArea];
+      const extra = a.kind === 'remove' && this.xvReady() ? ` · AI dựng lại nền · cách lấp ${(a.v | 0) + 1}/${XV_VARIANTS}` : '';
+      return { kind: 'area', i: this.selArea, o: a, label: ({ heal: 'Heal', clone: 'Clone', remove: 'Xoá vật thể' }[a.kind] || 'Vùng') + ' #' + (this.selArea + 1) + extra };
+    }
     if (this.selSpot >= 0 && rt.spots[this.selSpot]) { const s = rt.spots[this.selSpot]; return { kind: 'spot', i: this.selSpot, o: s, label: ({ dust: 'Vết bụi', heal: 'Điểm heal', clone: 'Điểm clone' }[s.type] || 'Điểm') + ' #' + (this.selSpot + 1) }; }
     return null;
   }
@@ -605,7 +787,7 @@ class App {
     const rt = this.s.retouch, areas = rt.areas || [];
     const sel = this.rtSel();
     const tol = 14 / this.viewer.z / (this.viewer.cv.width / this.outW());
-    if (sel && sel.kind === 'area' && sel.o.off && this.areaDist(sel.o, u, sel.o.off) <= tol) return ['area_src', sel.i];
+    if (sel && sel.kind === 'area' && sel.o.off && !(sel.o.kind === 'remove' && this.xvReady()) && this.areaDist(sel.o, u, sel.o.off) <= tol) return ['area_src', sel.i];
     for (let i = areas.length - 1; i >= 0; i--) if (areas[i].pts && this.areaDist(areas[i], u) <= 0) return ['area', i];
     for (let i = (rt.spots || []).length - 1; i >= 0; i--) {
       const sp = rt.spots[i];
@@ -681,6 +863,10 @@ class App {
     if (a.kind === 'clone' && (this.cloneSrc || this.cloneOff)) {
       if (!this.cloneOff) this.cloneOff = [this.cloneSrc[0] - p0[0], this.cloneSrc[1] - p0[1]];
       a.off = this.cloneOff.slice(); a.cands = [a.off.slice()];
+    } else if (a.kind === 'remove' && this.xvReady()) {
+      // AI xoá hẳn vật rồi dựng lại nền (như PUM máy tính): không có vùng nguồn; v = cách lấp (Thử cách khác)
+      a.v = 0;
+      this.toast(this.ai.loaded ? 'Đang xoá vật thể (AI dựng lại nền phía sau)…' : 'Đang nạp AI xoá vật thể (lần đầu hơi lâu)…', 4000);
     } else {
       this.busy(true);
       try {
@@ -689,7 +875,7 @@ class App {
       } catch (e) { a.cands = [[a.r * 3, 0]]; a.off = a.cands[0].slice(); }
       this.busy(false);
     }
-    a.ci = 0;
+    if (a.off) a.ci = 0;
     this.begin({ heal: 'Heal', clone: 'Clone', remove: 'Xoá vật thể' }[a.kind]);
     this.s.retouch.areas.push(a);
     this.selArea = this.s.retouch.areas.length - 1; this.selSpot = -1;
@@ -700,9 +886,20 @@ class App {
     const sel = this.rtSel();
     if (sel && sel.kind === 'area') { this.begin('Độ mờ đục vùng tô'); sel.o.opacity = v; this.end(); }
   }
-  rtNextSource() {
+  async rtNextSource() {
     const sel = this.rtSel();
-    if (!sel || sel.kind !== 'area' || !(sel.o.cands || []).length) return this.toast('Chọn một vùng heal / xoá vật thể trước (chạm vào vùng đã tô)');
+    if (sel && sel.kind === 'area' && sel.o.kind === 'remove' && this.xvReady()) {
+      // xoá vật thể bằng AI: "thử cách khác" = đổi lượng bối cảnh đưa vào AI (4 cách, như phím / của PUM máy tính)
+      const a = sel.o;
+      this.begin('Thử cách lấp khác');
+      a.v = ((a.v | 0) + 1) % XV_VARIANTS;
+      delete a.off; delete a.cands; delete a.ci; delete a.fill;
+      this.end(); this.drawOverlay();
+      this.toast(`Cách lấp ${a.v + 1}/${XV_VARIANTS} — AI đang dựng lại nền…`, 2500);
+      return;
+    }
+    if (sel && sel.kind === 'area' && sel.o.kind === 'remove' && !(sel.o.cands || []).length) return this.offerAI();
+    if (!sel || sel.kind !== 'area' || !(sel.o.cands || []).length) return this.toast('Chọn một vùng đã tô trước (chạm vào vùng đó)');
     this.begin('Đổi nguồn');
     sel.o.ci = ((sel.o.ci || 0) + 1) % sel.o.cands.length; sel.o.off = sel.o.cands[sel.o.ci].slice();
     this.end(); this.drawOverlay();
@@ -737,7 +934,7 @@ class App {
       c.globalCompositeOperation = 'destination-out'; path(pts, off); c.strokeStyle = '#000'; c.lineWidth = Math.max(0, rr - 0.5 / z); c.stroke(); c.restore();
     };
     const sa = (rt.areas || [])[this.selArea];
-    if (sa && sa.pts) { ring(sa.pts, null, 'rgba(255,212,0,.95)'); if (sa.off) ring(sa.pts, sa.off, 'rgba(255,255,255,.7)'); }
+    if (sa && sa.pts) { ring(sa.pts, null, 'rgba(255,212,0,.95)'); if (sa.off && !(sa.kind === 'remove' && this.xvReady())) ring(sa.pts, sa.off, 'rgba(255,255,255,.7)'); }
     (rt.spots || []).forEach((sp, i) => {
       const p = this.srcToDisp([sp.x, sp.y]);
       c.strokeStyle = i === this.selSpot ? '#ffd400' : 'rgba(255,255,255,.7)'; c.lineWidth = 1.5 / z;
@@ -870,7 +1067,7 @@ class App {
     const pw = Math.max(1, Math.round(src.width * k)), ph = Math.max(1, Math.round(src.height * k));
     const rgba = src.region(0, 0, src.width, src.height, pw, ph), keep = rgba.slice();
     const id = 'x_' + p.id + '_' + side;
-    await this.call('base', { id, rgba, w: pw, h: ph, fullW: src.width, fullH: src.height, draftSide: 320 }, [rgba.buffer]);
+    await this.call('base', { id, rgba, w: pw, h: ph, fullW: src.width, fullH: src.height, draftSide: 320, photo: photoKey(p) }, [rgba.buffer]);
     const s = S.mergeSettings(p.settings);
     const ai = await import('./ai.js');
     const { needsPerson } = await import('./engine/portrait.js');
@@ -879,10 +1076,29 @@ class App {
     if (pa) await this.call('faces', { id, faces: await ai.faceLandmarks(keep, pw, ph) });
     return { id, src, release: () => { this.worker.postMessage({ type: 'drop', id }); if (src.close) src.close(); } };
   }
-  async renderPhotoPreview(p, side) {
+  // dựng nhiều bộ thông số cho CÙNG một ảnh (null = thông số của ảnh), giải mã ảnh một lần — dùng cho So sánh trước / sau
+  async renderPhotoVariants(p, side, list) {
     const prep = await this.preparePhoto(p, side);
     try {
-      const s = this.cur && p.id === this.cur.id ? this.s : S.mergeSettings(p.settings);
+      const out = [];
+      for (const o of list) {
+        const isCur = this.cur && p.id === this.cur.id;
+        // ảnh đang mở, thông số hiện tại: dùng luôn ảnh đang hiện (đã dựng xong) -> mở So sánh nhanh hơn
+        const v = this.viewer.img;
+        if (!o && isCur && side === PREVIEW_SIDE && v && this.lastWhich === 'full' && this.tool !== 'crop' && !this.inflight && !this.want) {
+          out.push({ w: v.width, h: v.height, rgba: new Uint8ClampedArray(v.data) });
+          continue;
+        }
+        const s = o ? S.mergeSettings(o) : (isCur ? this.s : S.mergeSettings(p.settings));
+        out.push(await this.call('render', { id: prep.id, which: 'full', settings: s, geom: true }));
+      }
+      return out;
+    } finally { if (prep.id !== (this.cur && this.cur.id)) prep.release(); }
+  }
+  async renderPhotoPreview(p, side, override) {
+    const prep = await this.preparePhoto(p, side);
+    try {
+      const s = override ? S.mergeSettings(override) : (this.cur && p.id === this.cur.id ? this.s : S.mergeSettings(p.settings));
       return await this.call('render', { id: prep.id, which: 'full', settings: s, geom: true });
     } finally { if (prep.id !== (this.cur && this.cur.id)) prep.release(); }
   }
@@ -1076,6 +1292,73 @@ class App {
   }
   resetAll() { this.begin('Đặt lại toàn bộ'); this.s = S.defaultSettings(); this.layerIdx = -1; this.end(); }
 
+  // ---------------- đặt lại nhiều mức (MainWindow.reset_settings / reset_images bản máy tính) ----------------
+  static resetSettings(old, kind, tab) {
+    const d = S.defaultSettings();
+    if (kind === 'all') return d;
+    const nw = S.mergeSettings(deep(old));
+    if (kind === 'color_tone') {           // màu, tông, chi tiết, hiệu ứng; giữ retouch, layer, khung cắt, xoay
+      for (const k of Object.keys(d)) if (!GEOM_KEYS.includes(k) && k !== 'retouch' && k !== 'layers') nw[k] = deep(d[k]);
+    } else if (kind === 'geometry') {
+      for (const k of GEOM_KEYS) nw[k] = deep(d[k]);
+    } else if (kind === 'retouch') {       // heal, clone, xoá vật thể, bụi, làm mịn da (giữ chân dung)
+      const p = nw.retouch.portrait;
+      nw.retouch = deep(d.retouch);
+      if (p) nw.retouch.portrait = p;
+    } else if (kind === 'portrait') nw.retouch.portrait = deep(d.retouch.portrait);
+    else if (kind === 'layers') nw.layers = [];
+    else if (kind === 'tab') {
+      if (tab === 'retouch') { const p = nw.retouch.portrait; nw.retouch = deep(d.retouch); nw.retouch.portrait = p; }
+      else if (tab === 'portrait') nw.retouch.portrait = deep(d.retouch.portrait);
+      else for (const k of TAB_KEYS[tab] || []) nw[k] = deep(d[k]);
+    }
+    return nw;
+  }
+  // đặt lại `kind` cho các ảnh; ảnh đang mở hoàn tác bằng ↶ như mọi thao tác, ảnh khác: mở ảnh đó rồi ↶
+  async resetPhotos(kind, photos, tab) {
+    const label = kind === 'tab' ? `Đặt lại tab "${(TABS_LABEL[tab] || tab)}"` : RESET_KINDS[kind];
+    if (photos.length > 1 && !confirm(`${label} cho ${photos.length} ảnh?\n\nCó thể lấy lại: mở từng ảnh rồi bấm ↶ Hoàn tác.`)) return;
+    await this.saveCurrent();
+    let changed = 0;
+    for (const p of photos) {
+      const isCur = this.cur && p.id === this.cur.id;
+      const old = S.mergeSettings(isCur ? this.s : p.settings);
+      const nw = App.resetSettings(old, kind, tab);
+      if (J(old) === J(S.mergeSettings(nw))) continue;
+      changed++;
+      if (isCur) {
+        this.begin(label); this.s = S.mergeSettings(nw);
+        if (this.layerIdx >= this.s.layers.length) this.layerIdx = this.s.layers.length - 1;
+        this.end();
+        continue;
+      }
+      const H = this.histories.get(p.id);
+      if (H) { H.stack.splice(H.idx + 1); H.stack.push({ label, s: J(S.mergeSettings(nw)) }); H.idx = H.stack.length - 1; }
+      else this.histories.set(p.id, { stack: [{ label: 'Trước khi đặt lại', s: J(old) }, { label, s: J(S.mergeSettings(nw)) }], idx: 1 });
+      p.settings = S.isDefault(nw) ? null : nw;
+      await store.putPhoto(p);
+    }
+    this.renderStrip();
+    this.toast(changed ? `${label}: ${changed} ảnh (↶ để lấy lại)` : `${label} — không có gì để đặt lại`, 3000);
+  }
+  openResetMenu(photos) {
+    const ps = photos || (this.cur ? [this.cur] : []);
+    if (!ps.length) return this.toast('Chưa mở ảnh nào');
+    const go = (kind, tab) => { this.closeSheet(); this.resetPhotos(kind, ps, tab); };
+    const tab = this.panels.cur;
+    const body = h('div', { class: 'menu' },
+      btn('Đặt lại toàn bộ chỉnh sửa', () => go('all')),
+      btn('Chỉ màu & tông (giữ retouch, layer, khung cắt)', () => go('color_tone')),
+      btn('Khung cắt, xoay, lật & ống kính', () => go('geometry')),
+      btn('Xoá retouch (heal, clone, xoá vật thể, bụi, làm mịn da)', () => go('retouch')),
+      btn('Đặt lại chân dung', () => go('portrait')),
+      btn('Xoá mọi layer', () => go('layers')),
+      !photos && TAB_KEYS[tab] !== undefined ? btn(`Đặt lại tab đang mở ("${TABS_LABEL[tab]}")`, () => go('tab', tab)) : null,
+      !photos && this.photos.length > 1 ? btn(`Đặt lại TOÀN BỘ ảnh trong app (${this.photos.length} ảnh)…`, () => { this.closeSheet(); this.resetPhotos('all', this.photos.slice()); }) : null,
+      hint(ps.length > 1 ? `Áp cho ${ps.length} ảnh đã chọn. Mỗi ảnh lấy lại được bằng ↶ Hoàn tác khi mở ảnh đó.` : 'Lấy lại được bằng ↶ Hoàn tác.'));
+    this.openSheet(ps.length > 1 ? `Đặt lại ${ps.length} ảnh` : 'Đặt lại', body);
+  }
+
   // ----------------------------------------------------------------- menu
   openSheet(title, body, full) {
     $('sheetTitle').textContent = title; $('sheetBody').replaceChildren(body);
@@ -1095,7 +1378,10 @@ class App {
       btn(simple ? '🔧 Giao diện đầy đủ (mọi công cụ như PUM máy tính)' : '✨ Giao diện đơn giản (dễ dùng)', () => { this.closeSheet(); this.panels.setMode(simple ? 'full' : 'simple'); }),
       btn('🗂 Thư viện (lọc, đánh sao, so sánh, xuất hàng loạt)', () => this.openLibrary()),
       btn('📂 Mở ảnh từ Ảnh / Tệp', () => { this.closeSheet(); $('file').click(); }),
+      p ? btn('↺ Đặt lại… (toàn bộ, màu & tông, khung cắt, retouch, chân dung, layer, tab đang mở)', () => this.openResetMenu()) : null,
+      p ? btn('◫ So sánh trước / sau (cùng ảnh, hoặc với bản sao ảo)', async () => { const m = await import('./ui/library.js'); await this.saveCurrent(); m.compare(this, [p]); }) : null,
       clip.el,
+      btn('🧽 Mô hình AI xoá vật thể' + (this.xvReady() ? ' (đã có)' : ' (chưa tải)'), () => this.aiMenu()),
       btn('🗑 Gỡ ảnh đang xem khỏi app', () => this.removeCurrent()),
       btn('💾 Sao lưu thông số + style ra tệp', () => this.backup()),
       btn('♻️ Khôi phục từ tệp sao lưu', () => this.restore()),
@@ -1162,7 +1448,9 @@ class App {
         'Bộ nhớ đã dùng', h('b', {}, est),
         'Lần mở ảnh gần nhất', h('b', {}, this.openMs ? `${this.openMs.toFixed(0)} ms` : '—'),
         'Lần dựng gần nhất', h('b', {}, this.lastMs ? `${this.lastMs.toFixed(0)} ms (${this.lastWhich === 'draft' ? 'bản nháp' : 'xem trước'})` : '—')),
-      hint('Ảnh chỉnh trên iPhone cho màu giống hệt PUM máy tính (cùng công thức). Style .json dùng chung hai bên.')));
+      hint('Ảnh chỉnh trên iPhone cho màu giống hệt PUM máy tính (cùng công thức). Style .json dùng chung hai bên.'),
+      h('div', { style: 'font-weight:600;margin-top:10px' }, `Có gì mới ở bản ${VERSION}`),
+      h('ul', { style: 'margin:4px 0 0 18px;padding:0;color:var(--fg2);font-size:13px' }, ...NOTES.map((t) => h('li', { style: 'margin:3px 0' }, t)))));
   }
 }
 
@@ -1176,6 +1464,8 @@ function straightenFromLine(dx, dy) {
 
 // một vùng của nguồn ảnh (decode.js: BitmapSource / ArraySource) ra RGBA ở cỡ (tw, th)
 export function drawScaled(src, sx, sy, sw, sh, tw, th) { return src.region(sx, sy, sw, sh, tw, th); }
+// mã ảnh dùng làm khoá kết quả AI xoá vật thể (bản sao ảo dùng chung tệp ảnh với ảnh gốc)
+export const photoKey = (p) => (p ? p.fileId || p.id : null);
 
 export async function shareOrDownload(blob, name, app) {
   const file = new File([blob], name, { type: blob.type });

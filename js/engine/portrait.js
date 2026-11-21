@@ -106,36 +106,24 @@ function circleInto(m, w, h, cx, cy, r, val = 1) {
     for (let x = Math.max(0, Math.floor(cx - r)); x <= Math.min(w - 1, Math.ceil(cx + r)); x++)
       if ((x - cx) ** 2 + (y - cy) ** 2 <= r * r) m[y * w + x] = val;
 }
-// biến đổi khoảng cách Euclid (bình phương) — Felzenszwalb
-function edt(mask, w, h, target) {      // khoảng cách tới điểm có mask == target
-  const INF = 1e20, f = new Float64Array(Math.max(w, h)), d = new Float64Array(w * h);
-  const v = new Int32Array(Math.max(w, h)), z = new Float64Array(Math.max(w, h) + 1), out = new Float64Array(Math.max(w, h));
-  const pass = (n, get, set) => {
-    for (let q = 0; q < n; q++) f[q] = get(q);
-    let k = 0; v[0] = 0; z[0] = -INF; z[1] = INF;
-    for (let q = 1; q < n; q++) {
-      let s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]);
-      while (s <= z[k]) { k--; s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]); }
-      k++; v[k] = q; z[k] = s; z[k + 1] = INF;
-    }
-    k = 0;
-    for (let q = 0; q < n; q++) { while (z[k + 1] < q) k++; out[q] = (q - v[k]) ** 2 + f[v[k]]; }
-    for (let q = 0; q < n; q++) set(q, out[q]);
-  };
-  for (let x = 0; x < w; x++) pass(h, (y) => (mask[y * w + x] === target ? 0 : INF), (y, val) => { d[y * w + x] = val; });
-  for (let y = 0; y < h; y++) pass(w, (x) => d[y * w + x], (x, val) => { d[y * w + x] = val; });
-  return d;
-}
+const f32 = Math.fround;                 // so sánh mảng float32 với số Python như NumPy (số được ép về float32)
+// portrait._dil / _ero ĐÚNG như OpenCV: r <= 4 -> cv2.dilate / erode ellipse (2·round(r)+1); lớn hơn ->
+// distanceTransform(DIST_L2, 3) (khoảng cách mặt nạ 3x3 0.955 / 1.3693, không phải Euclid đúng)
 function dil(m, w, h, r) {
-  r = Math.max(1, r); const rr = r <= 4 ? Math.round(r) : r;
-  const d = edt(m, w, h, 1), o = new Uint8Array(w * h);
-  for (let i = 0; i < o.length; i++) o[i] = d[i] <= rr * rr + 1e-9 ? 1 : 0;
+  r = Math.max(1, r);
+  const o = new Uint8Array(w * h);
+  if (r <= 4) { const d = cv.morphEllipse(m, w, h, 2 * cv.roundEven(r) + 1, true); for (let i = 0; i < o.length; i++) o[i] = d[i] ? 1 : 0; return o; }
+  const inv = new Uint8Array(w * h); for (let i = 0; i < inv.length; i++) inv[i] = m[i] ? 0 : 1;
+  const d = cv.distL2(inv, w, h), t = f32(r);
+  for (let i = 0; i < o.length; i++) o[i] = d[i] <= t ? 1 : 0;
   return o;
 }
 function ero(m, w, h, r) {
-  r = Math.max(1, r); const rr = r <= 4 ? Math.round(r) : r;
-  const d = edt(m, w, h, 0), o = new Uint8Array(w * h);
-  for (let i = 0; i < o.length; i++) o[i] = d[i] > rr * rr + 1e-9 ? 1 : 0;
+  r = Math.max(1, r);
+  const o = new Uint8Array(w * h);
+  if (r <= 4) { const d = cv.morphEllipse(m, w, h, 2 * cv.roundEven(r) + 1, false); for (let i = 0; i < o.length; i++) o[i] = d[i] ? 1 : 0; return o; }
+  const d = cv.distL2(m, w, h), t = f32(r);
+  for (let i = 0; i < o.length; i++) o[i] = d[i] > t ? 1 : 0;
   return o;
 }
 const and = (a, b) => { const o = new Uint8Array(a.length); for (let i = 0; i < a.length; i++) o[i] = a[i] && b[i] ? 1 : 0; return o; };
@@ -145,6 +133,88 @@ const any = (a) => { for (let i = 0; i < a.length; i++) if (a[i]) return true; r
 const sum = (a) => { let s = 0; for (let i = 0; i < a.length; i++) s += a[i]; return s; };
 function pct(vals, q) { return cv.percentile(vals, q); }
 const median = (v) => cv.percentile(v, 50);
+function vals(a, m) {                     // a[m] (kiểu NumPy)
+  let c = 0; for (let i = 0; i < m.length; i++) if (m[i]) c++;
+  const o = new Float32Array(c); c = 0;
+  for (let i = 0; i < m.length; i++) if (m[i]) o[c++] = a[i];
+  return o;
+}
+const madOf = (v, med) => median(v.map((x) => Math.abs(x - med)));
+// khung [y0, y1, x0, x1] (nửa mở) bao các điểm m khác 0; null nếu rỗng
+function bboxOf(m, w, h) {
+  let y0 = h, y1 = -1, x0 = w, x1 = -1;
+  for (let y = 0; y < h; y++) for (let x = 0, o = y * w; x < w; x++) if (m[o + x]) { if (y < y0) y0 = y; y1 = y; if (x < x0) x0 = x; if (x > x1) x1 = x; }
+  return y1 < 0 ? null : [y0, y1 + 1, x0, x1 + 1];
+}
+const growB = (b, m, w, h) => [Math.max(0, b[0] - m), Math.min(h, b[1] + m), Math.max(0, b[2] - m), Math.min(w, b[3] + m)];
+const unionB = (a, b) => (!a ? b : !b ? a : [Math.min(a[0], b[0]), Math.max(a[1], b[1]), Math.min(a[2], b[2]), Math.max(a[3], b[3])]);
+const interB = (a, b) => [Math.max(a[0], b[0]), Math.min(a[1], b[1]), Math.max(a[2], b[2]), Math.min(a[3], b[3])];
+const gRad = (s) => (Math.round(Math.max(0.4, s) * 8 + 1) | 1) >> 1;   // bán kính nhân Gauss của _blur (s <= 6)
+const dRad = (r) => Math.ceil(Math.max(1, r) / 0.955) + 1;              // tầm với của _dil / _ero bán kính r
+// _blur nhưng chỉ cần đúng trong box: s <= 6 thì lọc trên phần cắt (box + bán kính nhân) -> y hệt lọc cả ảnh;
+// s > 6 (_blur thu nhỏ cả ảnh) thì lọc cả ảnh. Ngoài box = 0.
+function blurBox(arr, w, h, c, s, box) {
+  const out = new Float32Array(w * h * c);
+  if (Math.max(0.4, s) > 6) { const b = blurArr(arr, w, h, c, s); out.set(b); return out; }
+  const [y0, y1, x0, x1] = growB(box, gRad(s), w, h), cw = x1 - x0, chh = y1 - y0;
+  const sub = new Float32Array(cw * chh * c);
+  for (let y = 0; y < chh; y++) sub.set(arr.subarray(((y + y0) * w + x0) * c, ((y + y0) * w + x1) * c), y * cw * c);
+  const b = cv.gaussianBlur({ w: cw, h: chh, c, d: sub }, Math.max(0.4, s)).d;
+  for (let y = box[0]; y < box[1]; y++) for (let x = box[2]; x < box[3]; x++) for (let k = 0; k < c; k++)
+    out[(y * w + x) * c + k] = b[((y - y0) * cw + x - x0) * c + k];
+  return out;
+}
+
+// ĐƯỜNG MẢNH CÓ HƯỚNG (portrait._line_aniso): trung bình bh dọc đoạn thẳng dài L ở nDir hướng (cv2.line trên ảnh
+// số thực = đoạn 8-liên thông, chuẩn hoá tổng 1; filter2D BORDER_REFLECT trên ảnh con box), lấy (hướng mạnh nhất -
+// trung bình các hướng). box = [y0, y1, x0, x1]; cbox (trong box): chỉ tính ở đó (ngoài = 0, dùng khi biết chắc bh = 0
+// quanh đó); mask: chỉ tính ở điểm khác 0. Ngoài box = 0.
+function lineAniso(bh, w, h, box, L, nDir = 12, cbox = null, mask = null) {
+  const [y0, y1, x0, x1] = box, bw = x1 - x0, bhh = y1 - y0;
+  const out = new Float32Array(w * h);
+  const [cy0, cy1, cx0, cx1] = cbox ? interB(cbox, box) : box;
+  if (bw <= 0 || bhh <= 0 || cy1 <= cy0 || cx1 <= cx0) return out;
+  const c = L >> 1, pw = bw + 2 * c, ph = bhh + 2 * c, pad = new Float32Array(pw * ph);
+  const xi = new Int32Array(pw); for (let i = 0; i < pw; i++) xi[i] = x0 + cv.borderReflect(i - c, bw);
+  for (let j = 0; j < ph; j++) { const sy = (y0 + cv.borderReflect(j - c, bhh)) * w, o = j * pw; for (let i = 0; i < pw; i++) pad[o + i] = bh[sy + xi[i]]; }
+  const cw = cx1 - cx0, chh = cy1 - cy0, rmax = new Float32Array(cw * chh).fill(-1e9), rsum = new Float32Array(cw * chh);
+  for (let t = 0; t < nDir; t++) {
+    const ang = Math.PI * t / nDir, dx = Math.cos(ang) * c, dy = Math.sin(ang) * c;
+    const pts = cv.linePoints(cv.roundEven(c - dx), cv.roundEven(c - dy), cv.roundEven(c + dx), cv.roundEven(c + dy));
+    const K = pts.length, of = new Int32Array(K), wt = f32(1 / K);
+    for (let k = 0; k < K; k++) of[k] = (pts[k][1] - c) * pw + pts[k][0] - c;
+    for (let y = cy0; y < cy1; y++) {
+      const pb = (y - y0 + c) * pw + c - x0, ob = (y - cy0) * cw - cx0, mo = y * w;
+      for (let x = cx0; x < cx1; x++) {
+        if (mask && !mask[mo + x]) continue;
+        const p = pb + x;
+        let s = 0;
+        for (let k = 0; k < K; k++) s += pad[p + of[k]];
+        s *= wt;
+        const q = ob + x;
+        if (s > rmax[q]) rmax[q] = s;
+        rsum[q] += s;
+      }
+    }
+  }
+  for (let y = cy0; y < cy1; y++) for (let x = cx0; x < cx1; x++) {
+    const q = (y - cy0) * cw + x - cx0, i = y * w + x;
+    if (!mask || mask[i]) out[i] = rmax[q] - rsum[q] / nDir;
+  }
+  return out;
+}
+
+// giữ các mảnh liên thông của m có ít nhất `frac` số điểm đạt `ok` (xét cả sợi, không từng điểm)
+function compFrac(m, ok, frac, w, h) {
+  const { n, lab } = components(m, w, h), o = new Uint8Array(w * h);
+  if (n <= 1) return o;
+  const tot = new Float64Array(n), good = new Float64Array(n);
+  for (let i = 0; i < lab.length; i++) { const l = lab[i]; tot[l]++; if (ok[i]) good[l]++; }
+  const keep = new Uint8Array(n), fr = f32(frac);
+  for (let i = 1; i < n; i++) keep[i] = good[i] >= f32(fr * Math.max(tot[i], 1)) ? 1 : 0;
+  for (let i = 0; i < o.length; i++) o[i] = keep[lab[i]];
+  return o;
+}
 
 function components(mask, w, h) {        // nhãn 8-liên thông + thống kê [x, y, w, h, area]
   const lab = new Int32Array(w * h), stats = [null];
@@ -197,13 +267,14 @@ function sub3(im, x0, y0, x1, y1) {
 }
 function put3(im, part, x0, y0) { for (let y = 0; y < part.h; y++) im.d.set(part.d.subarray(y * part.w * 3, (y + 1) * part.w * 3), ((y + y0) * im.w + x0) * 3); }
 
-function fillSpots(reg, mask, fw, texShift = true, srcok = null) {
+// src: chỉ lấy MÀU lấp từ vùng này (VD chỉ nền khi xoá tóc con: không kéo màu tóc tối ra nền)
+function fillSpots(reg, mask, fw, texShift = true, srcok = null, src = null) {
   const { w: W, h: H } = reg;
   const { n, lab, stats } = components(mask, W, H);
   if (n <= 1) return reg;
   const out = { w: W, h: H, c: 3, d: Float32Array.from(reg.d) };
-  const rb = blur3(reg, Math.max(0.6, fw * 0.0028));
-  const hp = new Float32Array(reg.d.length); for (let i = 0; i < hp.length; i++) hp[i] = reg.d[i] - rb.d[i];
+  const hp = new Float32Array(reg.d.length);
+  if (texShift) { const rb = blur3(reg, Math.max(0.6, fw * 0.0028)); for (let i = 0; i < hp.length; i++) hp[i] = reg.d[i] - rb.d[i]; }
   for (let i = 1; i < n; i++) {
     const [x, y, w, h] = stats[i];
     const mg = Math.trunc(Math.max(3, 0.8 * Math.max(w, h)));
@@ -212,11 +283,35 @@ function fillSpots(reg, mask, fw, texShift = true, srcok = null) {
     const ins = new Uint8Array(cw * chh);
     for (let yy = 0; yy < chh; yy++) for (let xx = 0; xx < cw; xx++) ins[yy * cw + xx] = lab[(yy + ya) * W + xx + xa] === i ? 1 : 0;
     const crop = sub3(out, xa, ya, xb, yb);
-    const dt = edt(ins, cw, chh, 0);
-    let mx = 0; for (let q = 0; q < dt.length; q++) if (ins[q]) mx = Math.max(mx, Math.sqrt(dt[q]));
+    const dt = cv.distL2(ins, cw, chh);       // độ dày vết: cv2.distanceTransform(DIST_L2, 3)
+    let mx = 0; for (let q = 0; q < dt.length; q++) if (ins[q] && dt[q] > mx) mx = dt[q];
     const thick = 2 * mx;
     let fill;
-    if (thick <= 40) {
+    if (src) {
+      // chỉ lấy màu từ vùng cho phép (nền), mở rộng dần tới khi đủ điểm lấy mẫu
+      const outm = new Float32Array(cw * chh); let os = 0;
+      for (let yy = 0; yy < chh; yy++) for (let xx = 0; xx < cw; xx++) {
+        const q = yy * cw + xx; if (!ins[q] && src[(yy + ya) * W + xx + xa]) { outm[q] = 1; os++; }
+      }
+      if (os < 3) continue;                 // quanh vết không có nền để lấy màu: để nguyên
+      const num = { w: cw, h: chh, c: 3, d: new Float32Array(cw * chh * 3) };
+      for (let q = 0; q < outm.length; q++) if (outm[q]) for (let k = 0; k < 3; k++) num.d[q * 3 + k] = crop.d[q * 3 + k];
+      let sg = Math.max(1.5, 0.8 * thick);
+      let nb = cv.gaussianBlur(num, sg).d, db = cv.gaussianBlur(cv.img1(cw, chh, outm), sg).d;
+      for (let it = 0; it < 3; it++) {
+        let mn = Infinity; for (let q = 0; q < db.length; q++) if (ins[q] && db[q] < mn) mn = db[q];
+        if (mn > 0.02) break;
+        sg *= 2;
+        nb = cv.gaussianBlur(num, sg).d; db = cv.gaussianBlur(cv.img1(cw, chh, outm), sg).d;
+      }
+      const t5 = f32(0.005);
+      fill = { w: cw, h: chh, c: 3, d: Float32Array.from(crop.d) };
+      for (let q = 0; q < ins.length; q++) {
+        if (!ins[q]) continue;
+        if (!(db[q] > t5)) { ins[q] = 0; continue; }
+        for (let k = 0; k < 3; k++) fill.d[q * 3 + k] = nb[q * 3 + k] / Math.max(db[q], 1e-4);
+      }
+    } else if (thick <= 40) {
       const outm = new Float32Array(cw * chh); for (let q = 0; q < outm.length; q++) outm[q] = ins[q] ? 0 : 1;
       const sg = Math.max(1, 0.6 * thick);
       const num = { w: cw, h: chh, c: 3, d: new Float32Array(cw * chh * 3) };
@@ -294,35 +389,159 @@ function spotMask(Y, Cr, skin, w, h, fw, amount, lightToo = false, skinlike = nu
   return dil(out, w, h, Math.max(1, fw * 0.005));
 }
 
-// hình thái với nhân ellipse k x k (blackhat / tophat)
-function morph(Y, w, h, k, op) {
-  const r = (k - 1) / 2, offs = [];
-  for (let j = -r; j <= r; j++) for (let i = -r; i <= r; i++) if ((i * i + j * j) <= (r + 0.5) ** 2) offs.push(j * w + i, i, j);
-  const run = (src, fn, init) => {
-    const o = new Float32Array(w * h);
-    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
-      let v = init;
-      for (let q = 0; q < offs.length; q += 3) {
-        let xx = x + offs[q + 1], yy = y + offs[q + 2];
-        if (xx < 0) xx = -xx; else if (xx >= w) xx = 2 * w - 2 - xx;
-        if (yy < 0) yy = -yy; else if (yy >= h) yy = 2 * h - 2 - yy;
-        v = fn(v, src[yy * w + xx]);
-      }
-      o[y * w + x] = v;
-    }
-    return o;
-  };
-  const er = (s) => run(s, Math.min, Infinity), di = (s) => run(s, Math.max, -Infinity);
-  const out = new Float32Array(w * h);
-  if (op === 'black') { const c = er(di(Y)); for (let i = 0; i < out.length; i++) out[i] = c[i] - Y[i]; }
-  else { const o = di(er(Y)); for (let i = 0; i < out.length; i++) out[i] = Y[i] - o[i]; }
-  return out;
-}
-
 function elongated(m, w, h, minRatio, minLen) {
   const { n, lab, stats } = components(m, w, h), keep = new Uint8Array(n);
   for (let i = 1; i < n; i++) { const [, , bw, bh, area] = stats[i]; const L = Math.hypot(bw, bh); if (L >= minLen && L * L / Math.max(1, area) >= minRatio * 2) keep[i] = 1; }
   const o = new Uint8Array(w * h); for (let i = 0; i < o.length; i++) o[i] = keep[lab[i]]; return o;
+}
+
+// Sợi tóc con bay ra ngoài NỀN quanh đầu (portrait._flyaways). Trả [mặt nạ sợi, khối tóc] (null nếu không có).
+// - Khối tóc = phần "giống màu tóc" (Lab, so với mẫu tóc) còn lại sau phép MỞ hình thái, nối liền mẫu tóc trên đỉnh
+//   đầu, không dính vào mặt -> không cần mặt nạ người chính xác.
+// - Chỉ tìm NGOÀI đường bao đầu (bao lồi mặt + khối tóc), trong dải sát quanh khối tóc.
+// - Sợi tóc = ĐƯỜNG MẢNH CÓ HƯỚNG (lineAniso); màu phải là hỗn hợp tóc + nền (xét cả sợi); sợi NGƯỢC sáng xét riêng.
+// - Phải mọc ra từ khối tóc và vươn ra đủ xa (phần lởm chởm ngắn tự nhiên ở viền tóc giữ nguyên).
+function flyaways(reg, Y, solid, above, seed, w, h, fw, amount, oval) {
+  const n = w * h;
+  if (sum(seed) < 50) return [null, null];
+  const faceHull = oval ? cv.hullFill(oval, w, h) : new Uint8Array(n);
+  const ring = and(and(dil(solid, w, h, 0.18 * fw), not(dil(solid, w, h, 0.06 * fw))), and(above, not(dil(faceHull, w, h, 0.05 * fw))));
+  if (sum(ring) < 50) return [null, null];
+  const ys = vals(Y, seed);
+  let yh = median(ys);
+  const yb = median(vals(Y, ring));
+  const dark = yh < yb;
+  // mẫu tóc hay lẫn nền (mặt nạ người lấn ra quanh đầu): giữ nửa tối hơn (tóc tối) / sáng hơn (tóc sáng)
+  const p50 = f32(pct(ys, 50));
+  seed = Uint8Array.from(seed, (s, i) => (s && (dark ? Y[i] <= p50 : Y[i] >= p50) ? 1 : 0));
+  yh = median(vals(Y, seed));
+  // "độ giống tóc" 0..1 theo cả độ sáng lẫn màu (Lab) so với mẫu tóc
+  const lab = new Float32Array(n * 3), t3 = [0, 0, 0], rd = reg.d;
+  for (let i = 0; i < n; i++) {
+    cv.rgb2labCv(rd[i * 3], rd[i * 3 + 1], rd[i * 3 + 2], t3);       // như cv2 (bảng + nội suy), không phải công thức
+    lab[i * 3] = t3[0]; lab[i * 3 + 1] = t3[1]; lab[i * 3 + 2] = t3[2];
+  }
+  const sl = [], sa = [], sb = [];
+  for (let i = 0; i < n; i++) if (seed[i]) { sl.push(lab[i * 3]); sa.push(lab[i * 3 + 1]); sb.push(lab[i * 3 + 2]); }
+  const mu = [median(sl), median(sa), median(sb)];
+  const sL = Math.max(6, 1.4826 * median(sl.map((v) => Math.abs(v - mu[0]))) * 1.5);
+  const sab = Math.max(3, 1.4826 * median(sa.map((v, j) => Math.hypot(v - mu[1], sb[j] - mu[2]))) * 1.5);
+  const hairness = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const dl = (lab[i * 3] - mu[0]) / sL, da = lab[i * 3 + 1] - mu[1], db = lab[i * 3 + 2] - mu[2];
+    hairness[i] = clamp01(1 - Math.sqrt(dl * dl + (da * da + db * db) / (sab * sab)) / 4);
+  }
+  if (median(vals(hairness, ring)) > 0.45) return [null, null];   // nền quá giống tóc: để nguyên
+  const k = Math.max(3, Math.trunc(0.024 * fw) | 1);
+  const hop = cv.morphOpen(hairness, w, h, k);
+  const massp = new Uint8Array(n); for (let i = 0; i < n; i++) massp[i] = hop[i] > 0.5 ? 1 : 0;   // sợi mảnh biến mất, khối dày còn
+  // khối tóc = phần "vẫn là tóc sau khi mở", nối liền mẫu tóc trên đỉnh đầu, KHÔNG dính vào mặt
+  let baseM = and(and(massp, dil(solid, w, h, 0.2 * fw)), above);
+  if (oval) baseM = and(baseM, not(dil(oval, w, h, 0.01 * fw)));
+  const { n: nb, lab: lb } = components(baseM, w, h);
+  const ids = new Uint8Array(nb); let anyId = false;
+  for (let i = 0; i < n; i++) if (seed[i] && lb[i] > 0) { ids[lb[i]] = 1; anyId = true; }
+  if (!anyId) return [null, null];
+  const mass = new Uint8Array(n); for (let i = 0; i < n; i++) mass[i] = ids[lb[i]];
+  // chỉ NGOÀI đường bao đầu (bao lồi của mặt + khối tóc): chân tóc trên trán / thái dương nằm trong bao
+  const headHull = cv.hullFill(oval ? or(mass, oval) : mass, w, h);
+  const zone = and(and(and(dil(mass, w, h, 0.14 * fw), not(mass)), and(above, not(massp))), not(dil(headHull, w, h, Math.max(1, 0.004 * fw))));
+  if (sum(zone) < 50) return [null, mass];
+  const ks = Math.max(3, Math.trunc(0.008 * fw) | 1);
+  // nền TẠI CHỖ: độ sáng trung bình phần nền quanh đó, không dùng một mức cho cả ảnh
+  const outm = Float32Array.from(dil(mass, w, h, 0.03 * fw), (v) => (v ? 0 : 1));
+  const sgb = Math.max(2, 0.08 * fw), yo = new Float32Array(n);
+  for (let i = 0; i < n; i++) yo[i] = Y[i] * outm[i];
+  const nY = blur1(yo, w, h, sgb), dY = blur1(outm, w, h, sgb);
+  const L = Math.max(7, Math.trunc(0.03 * fw) | 1);
+  const zb = bboxOf(zone, w, h);
+  const box = [Math.max(0, zb[0] - L), Math.min(h, zb[1] + L), Math.max(0, zb[2] - L), Math.min(w, zb[3] + L)];
+  // đường mảnh TỐI / SÁNG hơn xung quanh (ô dò nhỏ cỡ bề ngang sợi tóc) — chỉ cần trong box
+  const cls = cv.morphClose(Y, w, h, ks, box), opn = cv.morphOpen(Y, w, h, ks, box);
+  const bhDark = new Float32Array(n), bhLight = new Float32Array(n), bgness = new Float32Array(n);
+  const big = dark ? cv.morphClose(Y, w, h, k, box) : cv.morphOpen(Y, w, h, k, box);
+  const t06 = f32(0.06);
+  for (let y = box[0]; y < box[1]; y++) for (let x = box[2]; x < box[3]; x++) {
+    const i = y * w + x;
+    bhDark[i] = cls[i] - Y[i]; bhLight[i] = Y[i] - opn[i];
+    const bgY = nY[i] / Math.max(dY[i], 1e-4);
+    const span = f32(dark ? bgY - yh : yh - bgY);
+    bgness[i] = span > t06 ? (dark ? big[i] - yh : yh - big[i]) / Math.max(span, 1e-3) : 0;   // nền gần bằng tóc: bỏ qua
+  }
+  const bhl = dark ? bhDark : bhLight;
+  // điểm nằm trên một ĐƯỜNG CÓ HƯỚNG rõ và tự nó lệch khỏi nền một chút (ngọn tóc mờ vẫn theo được)
+  const strands = (bh, kmad) => {
+    const v = vals(bh, zone), med = median(v), mad = madOf(v, med) * 1.48 + 1e-5;
+    const an = lineAniso(bh, w, h, box, L);
+    const va = vals(an, zone), meda = median(va), mada = madOf(va, meda) * 1.48 + 1e-6;
+    const ta = f32(Math.max(0.004, meda + (kmad - 3.0 * amount) * mada)), tb = f32(Math.max(0.006, med + 1.5 * mad));
+    const o = new Uint8Array(n);
+    for (let i = 0; i < n; i++) o[i] = zone[i] && an[i] > ta && bh[i] > tb ? 1 : 0;
+    return o;
+  };
+  let cand = strands(bhl, 7.0);
+  const t55 = f32(0.55);
+  for (let i = 0; i < n; i++) if (cand[i] && !(bgness[i] > t55)) cand[i] = 0;
+  let sec = strands(dark ? bhLight : bhDark, 8.0);           // sợi NGƯỢC chiều sáng
+  // màu: hỗn hợp màu tóc + màu nền ngay sau sợi (nền = trung bình các điểm nền quanh đó)
+  const hc = [0, 1, 2].map((c) => { const v = []; for (let i = 0; i < n; i++) if (seed[i]) v.push(rd[i * 3 + c]); return median(v); });
+  const okb = new Float32Array(n), dl1 = dil(or(cand, sec), w, h, 1);
+  for (let i = 0; i < n; i++) okb[i] = zone[i] && !dl1[i] ? 1 : 0;
+  const sg = Math.max(1.5, fw * 0.02);
+  const den = blurBox(okb, w, h, 1, sg, box);
+  for (let i = 0; i < n; i++) den[i] = Math.max(den[i], 1e-4);
+  const ro = new Float32Array(n * 3); for (let i = 0; i < n; i++) for (let c = 0; c < 3; c++) ro[i * 3 + c] = rd[i * 3 + c] * okb[i];
+  const bgl = blurBox(ro, w, h, 3, sg, box);
+  // sợi mảnh mờ chỉ tối hơn nền 1–3%: không đòi alpha dương rõ; chỉ loại màu SAI hẳn (nới cho viền quang sai)
+  const okc = new Uint8Array(n), ta = f32(-0.015), tb = f32(1.4);
+  for (let i = 0; i < n; i++) {
+    if (!cand[i]) continue;
+    let dd = 0, vd = 0, v2 = 0;
+    for (let c = 0; c < 3; c++) { const b = bgl[i * 3 + c] / den[i], d = hc[c] - b, v = rd[i * 3 + c] - b; dd += d * d; vd += v * d; v2 += v * v; }
+    dd = Math.max(dd, 1e-6);
+    const al = vd / dd, res = Math.sqrt(Math.max(v2 - al * al * dd, 0));
+    okc[i] = al > ta && al < tb && res < 0.7 * Math.sqrt(dd) + 0.04 ? 1 : 0;
+  }
+  cand = compFrac(cand, okc, 0.45, w, h);       // xét theo CẢ SỢI: ngọn mờ / viền màu lẻ tẻ không làm sợi đứt khúc
+  cand = elongated(cand, w, h, 2.0, Math.max(4, fw * 0.012));
+  // SỢI NGƯỢC SÁNG (tóc được nắng / đèn viền chiếu thành sợi bạc trên phông sẫm, hoặc ngược lại): phải ÍT rực màu
+  // hơn nền, dài và mảnh rõ hơn sợi thường
+  if (any(sec)) {
+    const lo = new Float32Array(n * 3); for (let i = 0; i < n * 3; i++) lo[i] = lab[i] * okb[(i / 3) | 0];
+    const lbg = blurBox(lo, w, h, 3, sg, box);
+    const okc2 = new Uint8Array(n);
+    for (let i = 0; i < n; i++) {
+      if (!sec[i]) continue;
+      const ca = Math.hypot(lab[i * 3 + 1], lab[i * 3 + 2]), cb = Math.hypot(lbg[i * 3 + 1] / den[i], lbg[i * 3 + 2] / den[i]);
+      okc2[i] = ca <= cb + 6.0 ? 1 : 0;
+    }
+    sec = compFrac(and(sec, not(dil(cand, w, h, 1))), okc2, 0.6, w, h);
+    sec = elongated(sec, w, h, 3.0, Math.max(6, fw * 0.02));
+  }
+  cand = or(cand, sec);
+  const { n: nc, lab: lc } = components(cand, w, h);
+  if (nc <= 1) return [null, mass];
+  // mọc ra từ khối tóc (chạm vùng sát tóc, hoặc nối tiếp một sợi đã nhận)
+  const keep = new Uint8Array(nc);
+  const near = dil(mass, w, h, Math.max(2, 0.035 * fw));
+  for (let i = 0; i < n; i++) if (near[i] && cand[i]) keep[lc[i]] = 1;
+  keep[0] = 0;
+  for (let it = 0; it < 3; it++) {
+    const km = new Uint8Array(n); for (let i = 0; i < n; i++) km[i] = keep[lc[i]];
+    const g = dil(km, w, h, Math.max(2, 0.03 * fw));
+    let grew = false;
+    for (let i = 0; i < n; i++) if (g[i] && cand[i] && !keep[lc[i]]) { keep[lc[i]] = 1; grew = true; }
+    keep[0] = 0;
+    if (!grew) break;
+  }
+  // chỉ xoá sợi VƯƠN RA khỏi khối tóc đủ xa (phần lởm chởm ngắn tự nhiên ở viền tóc giữ nguyên)
+  const dist = cv.distL2(not(mass), w, h), reach = new Float32Array(nc);
+  for (let i = 0; i < n; i++) if (dist[i] > reach[lc[i]]) reach[lc[i]] = dist[i];
+  const tr = f32(fw * (0.030 - 0.014 * amount));
+  for (let l = 1; l < nc; l++) if (!(reach[l] >= tr)) keep[l] = 0;
+  keep[0] = 0;
+  const out = new Uint8Array(n); for (let i = 0; i < n; i++) out[i] = keep[lc[i]];
+  return [out, mass];
 }
 
 function edgeAttn(Y, mask, w, h, fw) {
@@ -372,8 +591,9 @@ function processFace(out, lm, p, imp, prot, person, W, H, ox, oy) {
   let mnx = Infinity, mxx = -Infinity, mny = Infinity, mxy = -Infinity;
   for (const i of OVAL) { const [x, y] = P(i); mnx = Math.min(mnx, x); mxx = Math.max(mxx, x); mny = Math.min(mny, y); mxy = Math.max(mxy, y); }
   const lx = Math.max(0, -ox), ly = Math.max(0, -oy), hx = Math.min(w, W - ox), hy = Math.min(h, H - oy);
-  const x0 = Math.trunc(Math.max(lx, mnx - 0.45 * fw)), x1 = Math.trunc(Math.min(hx, mxx + 0.45 * fw));
-  const y0 = Math.trunc(Math.max(ly, mny - 0.6 * fw)), y1 = Math.trunc(Math.min(hy, mxy + 0.95 * fw));
+  // vùng xử lý phủ hết mái tóc + sợi tóc con bay xa (tóc cao, búi tóc: đỉnh đầu cách đỉnh trán tới ~1 bề rộng mặt)
+  const x0 = Math.trunc(Math.max(lx, mnx - 0.6 * fw)), x1 = Math.trunc(Math.min(hx, mxx + 0.6 * fw));
+  const y0 = Math.trunc(Math.max(ly, mny - 1.0 * fw)), y1 = Math.trunc(Math.min(hy, mxy + 0.95 * fw));
   if (x1 - x0 < 16 || y1 - y0 < 16) return null;
   let reg = sub3(out, x0, y0, x1, y1);
   const sw = reg.w, sh = reg.h, n = sw * sh;
@@ -430,7 +650,8 @@ function processFace(out, lm, p, imp, prot, person, W, H, ox, oy) {
   if (hi > 0) {
     const Y = ch(ycc(reg), 0);
     const k = Math.max(3, Math.trunc(fw * 0.009) | 1);
-    const bh = morph(Y, sw, sh, k, 'black');
+    const cl = cv.morphClose(Y, sw, sh, k), bh = new Float32Array(n);      // MORPH_BLACKHAT ellipse như OpenCV
+    for (let i = 0; i < n; i++) bh[i] = cl[i] - Y[i];
     const folds = new Uint8Array(n);
     for (const [a_, b_] of [[98, 61], [327, 291], [64, 98], [294, 327]]) lineInto(folds, sw, sh, Q(a_).map(Math.trunc), Q(b_).map(Math.trunc), Math.max(2, Math.trunc(0.09 * fw)), 1);
     for (const i of [98, 327, 64, 294, 48, 278, 129, 358]) { const [qx, qy] = Q(i); circleInto(folds, sw, sh, Math.trunc(qx), Math.trunc(qy), Math.trunc(0.07 * fw)); }
@@ -441,13 +662,13 @@ function processFace(out, lm, p, imp, prot, person, W, H, ox, oy) {
       const med = median(v), t = med + (7 - 3.5 * hi) * (median(v.map((x) => Math.abs(x - med))) * 1.48 + 1e-5);
       const cand = new Uint8Array(n); for (let i = 0; i < n; i++) cand[i] = bh[i] > t && sk[i] ? 1 : 0;
       const { n: nc, lab, stats } = components(cand, sw, sh);
-      const dist = edt(cand, sw, sh, 0);
+      const dist = cv.distL2(cand, sw, sh);      // cv2.distanceTransform(DIST_L2, 3)
       const keep = new Uint8Array(nc);
       for (let i = 1; i < nc; i++) {
         const [x, y, bw2, bh2, area] = stats[i];
         const L_ = Math.hypot(bw2, bh2);
         if (L_ < fw * 0.07) continue;
-        let mx = 0; for (let yy = y; yy < y + bh2; yy++) for (let xx = x; xx < x + bw2; xx++) if (lab[yy * sw + xx] === i) mx = Math.max(mx, Math.sqrt(dist[yy * sw + xx]));
+        let mx = 0; for (let yy = y; yy < y + bh2; yy++) for (let xx = x; xx < x + bw2; xx++) if (lab[yy * sw + xx] === i) mx = Math.max(mx, dist[yy * sw + xx]);
         if (2 * mx > Math.max(2.5, fw * 0.008) || L_ * L_ / Math.max(1, area) < 12) continue;
         keep[i] = 1;
       }
@@ -617,22 +838,50 @@ function processFace(out, lm, p, imp, prot, person, W, H, ox, oy) {
   const ho = (p.hair_outer || 0) / 100 * imp;
   if (ho > 0 && person) {
     const pm2 = new Uint8Array(n); for (let i = 0; i < n; i++) pm2[i] = pm[i] > 0.5 ? 1 : 0;
-    const kk = Math.trunc(0.05 * fw) | 1, rk = (kk - 1) / 2;
-    const solid = rk >= 1 ? dil(ero(pm2, sw, sh, rk), sw, sh, rk) : pm2;
-    const band = and(dil(solid, sw, sh, 0.12 * fw), not(ero(solid, sw, sh, 0.005 * fw)));
-    const chinY = Math.trunc(Q(152)[1]);
-    for (let y = Math.max(0, chinY); y < sh; y++) for (let x = 0; x < sw; x++) band[y * sw + x] = 0;
     const Y = ch(ycc(reg), 0);
-    const k = Math.max(3, Math.trunc(fw * 0.02) | 1);
-    const b1 = morph(Y, sw, sh, k, 'black'), t1 = morph(Y, sw, sh, k, 'top');
-    const thin = new Float32Array(n); for (let i = 0; i < n; i++) thin[i] = Math.max(b1[i], t1[i]);
-    const v = []; for (let i = 0; i < n; i++) if (band[i]) v.push(thin[i]);
-    if (v.length > 50) {
-      const med = median(v), t = med + (6 - 3.5 * ho) * (median(v.map((x) => Math.abs(x - med))) * 1.48 + 1e-5);
-      const c0 = new Uint8Array(n); for (let i = 0; i < n; i++) c0[i] = thin[i] > t && band[i] && !solid[i] ? 1 : 0;
-      const m = elongated(c0, sw, sh, 2.5, Math.max(5, fw * 0.02));
-      for (let i = 0; i < n; i++) if (pr[i] >= 0.5) m[i] = 0;
-      reg = fillSpots(reg, dil(m, sw, sh, 1), fw, false);
+    const above = new Uint8Array(n);
+    above.fill(1, 0, Math.min(sh, Math.max(1, Math.trunc(Q(152)[1]))) * sw);        // chỉ quanh đầu (trên cằm)
+    let solid = cv.morphOpen(pm2, sw, sh, Math.trunc(0.05 * fw) | 1);
+    // Khối tóc THẬT: mặt nạ người thường lọt vào trong mái tóc, nên mép tóc thật bị coi là "tóc con" và bị lấp
+    // (thành đốm tối). Lấy thêm phần tối giống tóc sát quanh mặt nạ (tóc tối hơn nền rõ rệt).
+    const ringo = and(and(dil(solid, sw, sh, 0.18 * fw), not(dil(solid, sw, sh, 0.06 * fw))), above);
+    const browY = Math.trunc(Math.min(Q(105)[1], Q(334)[1]));
+    const hairIn = and(solid, above); hairIn.fill(0, Math.max(0, Math.min(sh, browY)) * sw);
+    // mẫu màu tóc THUẦN: dải hẹp ngay trên đỉnh trán (mốc 10), giữa đầu — theo vị trí mặt, KHÔNG theo mặt nạ người
+    const hairPure = new Uint8Array(n);
+    const q10 = Q(10);
+    const r0 = Math.trunc(Math.max(0, q10[1] - 0.6 * fw)), r1 = Math.min(sh, Math.trunc(Math.max(1, q10[1] - 0.02 * fw)));
+    const c0 = Math.trunc(Math.max(0, q10[0] - 0.3 * fw)), c1 = Math.trunc(Math.min(sw, q10[0] + 0.3 * fw));
+    for (let y = r0; y < r1; y++) for (let x = c0; x < c1; x++) hairPure[y * sw + x] = 1;
+    // mẫu tóc phải TỐI hơn da má rõ rệt (da trán bị đèn làm gần trắng / tóc ánh màu phông thì nhận da theo màu sai)
+    const Y0 = ch(Yc, 0);
+    const ovSk = new Uint8Array(n); for (let i = 0; i < n; i++) ovSk[i] = oval[i] && skinlike[i] > f32(0.6) ? 1 : 0;
+    const cheekY = any(ovSk) ? median(vals(Y0, ovSk)) : any(oval) ? median(vals(Y0, oval)) : 1.0;
+    const tc = f32(cheekY - 0.08), tc6 = f32(0.6 * cheekY), t3 = f32(0.3);
+    for (let i = 0; i < n; i++) if (hairPure[i] && !(Y[i] < tc && (skinlike[i] < t3 || Y[i] < tc6))) hairPure[i] = 0;
+    if (sum(hairPure) > 200) {                 // dải tìm có thể lẫn phông (tóc ngắn): lấy 35% điểm tối nhất
+      const t35 = f32(pct(vals(Y, hairPure), 35));
+      for (let i = 0; i < n; i++) if (hairPure[i] && !(Y[i] <= t35)) hairPure[i] = 0;
+    }
+    if (sum(ringo) > 50 && sum(hairIn) > 50) {
+      const yb_ = median(vals(Y, ringo)), yh_ = median(vals(Y, hairIn));
+      if (Math.abs(yb_ - yh_) > 0.12) {
+        const th = f32((yb_ + yh_) / 2), near = dil(solid, sw, sh, 0.05 * fw);
+        let grow = new Uint8Array(n);
+        for (let i = 0; i < n; i++) grow[i] = (yh_ < yb_ ? Y[i] < th : Y[i] > th) && near[i] && above[i] ? 1 : 0;
+        grow = cv.morphOpen(grow, sw, sh, Math.trunc(0.03 * fw) | 1);
+        solid = or(solid, grow);
+      }
+    }
+    // không có mẫu tóc chắc chắn (hói, đội mũ, tóc sáng màu): để nguyên, không đoán bừa
+    const [m, hb] = sum(hairPure) > 200 ? flyaways(reg, Y, solid, above, hairPure, sw, sh, fw, ho, oval) : [null, null];
+    if (hb) solid = hb;
+    if (m && any(m)) {
+      for (let i = 0; i < n; i++) if (!(pr[i] < 0.5)) m[i] = 0;
+      // chỉ lấy màu lấp từ NỀN (không phải khối tóc, không phải sợi tóc khác) -> không còn đốm tối
+      const md = dil(m, sw, sh, 1);
+      const bg = and(not(dil(solid, sw, sh, Math.max(2, 0.012 * fw))), not(md));
+      reg = fillSpots(reg, md, fw, false, null, bg);
     }
   }
   put3(out, reg, x0, y0);
@@ -675,6 +924,160 @@ function skinTone(img, mask, p, imp, samples, W, H) {
   return rgb(y);
 }
 
+// Tính theo độ sáng TƯƠNG ĐỐI (log): nếp nhăn trên áo trắng phơi nắng và trên vest đen cùng một thước đo
+// (chênh 0.2 log ~ 20%), viền thật (vest / sơ mi, khăn túi, nút) luôn chênh hơn hẳn.
+const WRINKLE_LOG_EPS = 0.10;  // log(Y + eps): vùng tối (vest đen) không bị phóng đại chênh lệch / nhiễu
+const WRINKLE_AMP = 0.20;      // nếp nhăn = chênh sáng tương đối NHỎ; chênh lớn hơn (tới 2x thì thôi hẳn) là chi tiết thật
+const WRINKLE_EDGE = 0.42;     // chênh tương đối cục bộ từ mức này: đường viền rõ (áo / nền, vest / sơ mi, ve, khăn) -> khoá
+const WRINKLE_SC = 0.30;       // lọc song phương: chênh được trộn (lớn hơn nếp nhăn, nhỏ hơn viền áo / khăn / sơ mi)
+const WRINKLE_SS = 0.15;       // lọc song phương: bán kính trộn nếp MỀM (theo bề rộng mặt)
+const WRINKLE_SS_FINE = 0.03;  // lọc song phương: bán kính trộn nếp NHỎ, SẮC
+const WRINKLE_TEX = 0.003;     // dưới cỡ này (theo bề rộng mặt) là kết cấu sợi vải: giữ nguyên
+const WRINKLE_FINE = 0.85;     // nếp nhỏ sắc (tối) bớt tới 85% ở mức 100 — gờ sáng bớt ít hơn chút
+const WRINKLE_SOFT = 0.60;     // nếp mềm vừa chỉ dịu bớt 60%: áo vẫn có khối, không phẳng như nhựa
+const WRINKLE_FACE_PX = 70.0;  // nếp mềm: tính trên ảnh thu nhỏ để mặt ~70 px (chi tiết thô) -> nhanh
+const WRINKLE_FACE_PX_FINE = 220.0;   // nếp nhỏ sắc: cần nét hơn (mặt ~220 px)
+export const _wrinkleOpts = { full: false };   // kiểm tra: true = tính cả ảnh (không giới hạn khung) để so
+
+function shrinkA(a, w, h, f) {           // cv2.resize INTER_AREA để mặt về cỡ f (tối thiểu 8 điểm)
+  if (f >= 1) return { d: a, w, h };
+  const nw = Math.max(8, cv.roundEven(w * f)), nh = Math.max(8, cv.roundEven(h * f));
+  return { d: cv.resizeArea(cv.img1(w, h, a), nw, nh).d, w: nw, h: nh };
+}
+// mặt nạ các điểm cách (theo ô vuông) <= r điểm một điểm khác 0 của m
+function boxDil(m, w, h, r) {
+  const t = new Uint8Array(w * h), o = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) {
+    const off = y * w;
+    for (let x = 0, last = -1e9; x < w; x++) { if (m[off + x]) last = x; if (x - last <= r) t[off + x] = 1; }
+    for (let x = w - 1, last = 1e9; x >= 0; x--) { if (m[off + x]) last = x; if (last - x <= r) t[off + x] = 1; }
+  }
+  for (let x = 0; x < w; x++) {
+    for (let y = 0, last = -1e9; y < h; y++) { if (t[y * w + x]) last = y; if (y - last <= r) o[y * w + x] = 1; }
+    for (let y = h - 1, last = 1e9; y >= 0; y--) { if (t[y * w + x]) last = y; if (last - y <= r) o[y * w + x] = 1; }
+  }
+  return o;
+}
+// điểm của ảnh lớn (w, h) góp vào (qua INTER_AREA) một điểm thuộc mặt nạ ms của ảnh nhỏ (sw, sh)
+function upMask(ms, sw, sh, w, h) {
+  const d = boxDil(ms, sw, sh, 1), o = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) {
+    const qy = Math.min(sh - 1, Math.floor(y * sh / h)) * sw;
+    for (let x = 0; x < w; x++) o[y * w + x] = d[qy + Math.min(sw - 1, Math.floor(x * sw / w))];
+  }
+  return o;
+}
+// "trong áo, không sát mép mặt nạ người" của _wrinkle_band: msIn, sup = (msIn > 0), need = khung chứa sup
+function msInOf(ms, w, h, fws) {
+  const n = w * h, msb = new Uint8Array(n);
+  for (let i = 0; i < n; i++) msb[i] = ms[i] > 0.5 ? 1 : 0;
+  const S = bboxOf(msb, w, h), msIn = new Float32Array(n), sup = new Uint8Array(n);
+  if (!S) return { msIn, sup, need: null };
+  const s = Math.max(1, fws * 0.01), need = growB(S, gRad(s) + 1, w, h);
+  const e = Float32Array.from(ero(msb, w, h, Math.max(1, fws * 0.015)));
+  const b = _wrinkleOpts.full ? blur1(e, w, h, s) : blurBox(e, w, h, 1, s, need);
+  for (let i = 0; i < n; i++) { msIn[i] = clamp01(b[i]); sup[i] = msIn[i] > 0 ? 1 : 0; }
+  return { msIn, sup, need };
+}
+
+// Dải nếp nhăn ở một cỡ (portrait._wrinkle_band): lo - (lo lọc song phương). Trả dải, trọng số = cổng biên độ x khoá
+// viền x trong áo (mi = msInOf), nền đã lọc. bmask: điểm cần nền lọc đúng (lọc song phương chỉ tính ở đó).
+function wrinkleBand(lo, mi, w, h, fws, ss, bmask) {
+  const n = w * h, full = _wrinkleOpts.full, sp = Math.max(1.5, fws * ss);
+  const bb = bmask && bboxOf(bmask, w, h);
+  const base = full ? cv.bilateral(lo, w, h, WRINKLE_SC, sp) : bb ? cv.bilateral(lo, w, h, WRINKLE_SC, sp, bb, bmask) : Float32Array.from(lo);
+  const k = Math.max(3, Math.trunc(fws * 0.04) | 1);
+  const rl = Math.max(1, fws * 0.02), sl = Math.max(1, fws * 0.015);
+  // khoá viền: chênh sáng cục bộ lớn (giãn - co) -> chỉ cần đúng trong khung có trọng số
+  const lbox = full ? null : growB(mi.need, gRad(sl) + dRad(rl), w, h);
+  const di = cv.morphEllipse(lo, w, h, k, true, lbox), er = cv.morphEllipse(lo, w, h, k, false, lbox);
+  const edge = new Uint8Array(n), te = f32(WRINKLE_EDGE);
+  for (let i = 0; i < n; i++) edge[i] = f32(di[i] - er[i]) > te ? 1 : 0;
+  const ld = Float32Array.from(dil(edge, w, h, rl));
+  const lock = full ? blur1(ld, w, h, sl) : blurBox(ld, w, h, 1, sl, mi.need);
+  const band = new Float32Array(n), wt = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    band[i] = lo[i] - base[i];
+    wt[i] = clamp01(2 - Math.abs(band[i]) / WRINKLE_AMP) * (1 - clamp01(lock[i])) * mi.msIn[i];
+  }
+  return { band, wt, base };
+}
+
+// Làm phẳng nếp nhăn áo cho THẬT (portrait._flatten_wrinkles): xử lý theo cỡ như thợ chỉnh ảnh —
+// kết cấu sợi vải (rất nhỏ) giữ nguyên; nếp gấp NHỎ, SẮC bớt mạnh (WRINKLE_FINE, tính ở độ nét cao hơn); nếp MỀM vừa chỉ
+// dịu bớt (WRINKLE_SOFT); khối sáng tối LỚN giữ nguyên. Mỗi dải: nền mượt = lọc song phương (chỉ trộn điểm CÙNG MÀU);
+// chỉ chỉnh chênh sáng nhỏ (<= WRINKLE_AMP); khoá sát chỗ chênh sáng cục bộ lớn (viền) và đường cấu trúc thẳng dài.
+// Các phép nặng (lọc song phương, đường có hướng, co / giãn, làm mờ mặt nạ) chỉ tính ở những điểm ảnh hưởng tới kết
+// quả trong áo — kết quả y hệt tính cả ảnh.
+function flattenWrinkles(Y, cmask, W, H, fw, amount) {
+  const N = W * H, full = _wrinkleOpts.full;
+  const f1 = Math.min(1, WRINKLE_FACE_PX_FINE / Math.max(1, fw));
+  const LY = new Float32Array(N); for (let i = 0; i < N; i++) LY[i] = Math.log(Math.max(Y[i], 0) + WRINKLE_LOG_EPS);
+  const s1 = shrinkA(LY, W, H, f1), w1 = s1.w, h1 = s1.h, n1 = w1 * h1, m1 = shrinkA(cmask, W, H, f1).d, fw1 = fw * f1;
+  const f2 = Math.min(1, WRINKLE_FACE_PX / Math.max(1, fw)) / f1;
+  const fw2 = fw1 * Math.min(1, f2);
+  const m2s = shrinkA(m1, w1, h1, f2), w2 = m2s.w, h2 = m2s.h, m2 = m2s.d;
+  const A1 = msInOf(m1, w1, h1, fw1);
+  let c1 = null, c2 = null;
+  if (A1.need) {
+    const A2 = msInOf(m2, w2, h2, fw2);
+    // nền bước 2 (ảnh nhỏ) cần đúng quanh chỗ trọng số bước 2 khác 0: tầm lọc song phương / co giãn + khoá viền
+    const r2 = Math.max(1, cv.roundEven(Math.max(1.5, fw2 * WRINKLE_SS) * 1.5)), k2 = Math.max(3, Math.trunc(fw2 * 0.04) | 1);
+    const M2 = Math.max(r2, gRad(Math.max(1, fw2 * 0.015)) + dRad(Math.max(1, fw2 * 0.02)) + (k2 >> 1)) + 1;
+    const bm1 = Uint8Array.from(A1.sup);
+    if (A2.need) { const u = upMask(boxDil(A2.sup, w2, h2, M2), w2, h2, w1, h1); for (let i = 0; i < n1; i++) bm1[i] |= u[i]; }
+    // 1) nếp nhỏ sắc: dải (trên cỡ sợi vải .. cỡ nếp nhỏ), tính ở độ nét cao; nếp TỐI bớt nhiều hơn gờ sáng
+    const lo1 = blur1(s1.d, w1, h1, Math.max(0.5, fw1 * WRINKLE_TEX));
+    const b1 = wrinkleBand(lo1, A1, w1, h1, fw1, WRINKLE_SS_FINE, bm1);
+    // ĐƯỜNG CẤU TRÚC của áo (ve áo, nẹp khuy, đường may, miệng túi): DÀI và THẲNG; nếp nhăn thì cong, ngắn.
+    // Không làm phẳng quanh chúng — nếu làm phẳng bóng hai bên mà để lại nét mảnh của ve áo, ve áo trông như nét vẽ.
+    const m03 = new Uint8Array(n1), t03 = f32(0.3); for (let i = 0; i < n1; i++) m03[i] = m1[i] > t03 ? 1 : 0;
+    const B03 = bboxOf(m03, w1, h1);
+    const G = B03 ? cv.sobelMag(lo1, w1, h1, full ? null : B03) : new Float32Array(n1);
+    for (let i = 0; i < n1; i++) if (!m03[i]) G[i] = 0;
+    const Ls = Math.max(9, Math.trunc(fw1 * 0.12) | 1), rs = Math.max(1, fw1 * 0.012);
+    // khoá cấu trúc cần đúng ở chỗ trọng số khác 0 của cả hai bước (bước 2 lấy nó qua thu nhỏ); ngưỡng lấy trên m1 > 0.5
+    const sm = Uint8Array.from(A1.sup);
+    if (A2.need) { const u = upMask(A2.sup, w2, h2, w1, h1); for (let i = 0; i < n1; i++) sm[i] |= u[i]; }
+    const am = boxDil(sm, w1, h1, gRad(rs) + dRad(rs));
+    const m05 = new Uint8Array(n1); for (let i = 0; i < n1; i++) { m05[i] = m1[i] > 0.5 ? 1 : 0; if (m05[i]) am[i] = 1; }
+    const an = full ? lineAniso(G, w1, h1, [0, h1, 0, w1], Ls) : B03 ? lineAniso(G, w1, h1, [0, h1, 0, w1], Ls, 12, growB(B03, Ls >> 1, w1, h1), am) : new Float32Array(n1);
+    const va = vals(an, m05);
+    const struct = new Uint8Array(n1);
+    if (va.length > 100) {
+      const med = median(va), mad = madOf(va, med) * 1.48 + 1e-6, ts = f32(Math.max(0.03, med + 7.0 * mad));
+      for (let i = 0; i < n1; i++) struct[i] = an[i] > ts ? 1 : 0;
+    }
+    const sd = Float32Array.from(dil(struct, w1, h1, rs));
+    const slock = full ? blur1(sd, w1, h1, rs) : blurBox(sd, w1, h1, 1, rs, bboxOf(sm, w1, h1));
+    for (let i = 0; i < n1; i++) slock[i] = clamp01(slock[i]);
+    c1 = new Float32Array(n1);
+    for (let i = 0; i < n1; i++) {
+      const bd = b1.band[i], wt = b1.wt[i] * (1 - slock[i]);
+      c1[i] = -bd * wt * (bd < 0 ? WRINKLE_FINE : WRINKLE_FINE * 0.9);
+    }
+    // 2) nếp mềm: dải NỐI TIẾP ngay trên (nền của bước 1 .. cỡ khối lớn) -> hai dải không chồng nhau; chỉ dịu bớt
+    if (A2.need) {
+      const b2in = shrinkA(b1.base, w1, h1, f2).d;
+      const b2 = wrinkleBand(b2in, A2, w2, h2, fw2, WRINKLE_SS, A2.sup);
+      const sl2 = shrinkA(slock, w1, h1, f2).d;
+      c2 = new Float32Array(w2 * h2);
+      for (let i = 0; i < c2.length; i++) c2[i] = -b2.band[i] * (b2.wt[i] * (1 - sl2[i])) * WRINKLE_SOFT;
+      if (f2 < 1) c2 = cv.resizeLinear(cv.img1(w2, h2, c2), w1, h1).d;
+    }
+  }
+  let corr = new Float32Array(n1);
+  if (c1) for (let i = 0; i < n1; i++) corr[i] = (c1[i] + (c2 ? c2[i] : 0)) * amount;
+  if (f1 < 1) corr = cv.resizeLinear(cv.img1(w1, h1, corr), W, H).d;
+  // sửa theo TỈ LỆ (nhân): kết cấu sợi vải trong nếp tối được nâng cùng độ sáng, không bị bệt
+  const out = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    const c = corr[i] * clamp01(cmask[i] * 1.5), y = Y[i];
+    out[i] = (Math.max(y, 0) + WRINKLE_LOG_EPS) * Math.exp(c) - WRINKLE_LOG_EPS + Math.min(y, 0);
+  }
+  return out;
+}
+
 function clothes(img, cm, fw, p, imp) {
   const wr = (p.cloth_wrinkle || 0) / 100 * imp, spt = (p.cloth_spots || 0) / 100 * imp, edg = (p.cloth_edges || 0) / 100 * imp;
   const { w, h } = img, n = w * h;
@@ -688,9 +1091,8 @@ function clothes(img, cm, fw, p, imp) {
     out = fillSpots(out, m, fw * 1.2, true, ok);
   }
   if (wr > 0) {
-    const y = ycc(out), Y = ch(y, 0);
-    const a = blur1(Y, w, h, Math.max(1, fw * 0.012)), b = blur1(Y, w, h, Math.max(4, fw * 0.09));
-    for (let i = 0; i < n; i++) y.d[i * 3] -= (a[i] - b[i]) * cm[i] * wr * 0.8;
+    const y = ycc(out), Y = flattenWrinkles(ch(y, 0), cm, w, h, fw, Math.min(1, wr));
+    for (let i = 0; i < n; i++) y.d[i * 3] = Y[i];
     out = rgb(y);
   }
   if (edg > 0) {
@@ -804,7 +1206,11 @@ function slimBody(out, person, chinY, fw, amount, oy) {
 
 // ---------------------------------------------------------------------------- điểm vào
 // img: ảnh vùng; faces: [Float32Array(478*2)] toạ độ chuẩn hoá; personFn(w, h, roi) -> mặt nạ; roi = [ox, oy, W, H]
-export function applyPortrait(img, p, faces, personFn, roi) {
+// opt.infosOut: mảng nhận thông tin từng mặt đã xử lý (chuẩn hoá theo cả ảnh) — lấy từ bản xem trước;
+// opt.faceInfos: thông tin đó dùng cho các bước toàn thân (da thân, tông da, quần áo, thon người) khi dựng THEO DẢI
+// (xuất cỡ gốc, phóng 1:1): dải nằm xa mặt vẫn có bề rộng mặt / cằm / mẫu màu da như khi dựng cả ảnh (bản máy tính
+// chạy chân dung trên cả ảnh), nên áo phía dưới vẫn được xoá nếp nhăn và mọi dải dùng cùng một mẫu da.
+export function applyPortrait(img, p, faces, personFn, roi, opt = {}) {
   if (!portraitActive(p) || !faces || !faces.length) return img;
   const [ox, oy, W, H] = roi || [0, 0, img.w, img.h];
   let out = { w: img.w, h: img.h, c: 3, d: Float32Array.from(img.d) };
@@ -824,9 +1230,13 @@ export function applyPortrait(img, p, faces, personFn, roi) {
   const sel = who === 'all' ? order : (/^\d+$/.test(String(who)) && +who < order.length ? [order[+who]] : []);
   const infos = [];
   for (const i of sel) { const inf = processFace(out, faces[i], p, imp, prot, person, W, H, ox, oy); if (inf) infos.push(inf); }
-  if (!infos.length) { for (let i = 0; i < out.d.length; i++) out.d[i] = clamp01(out.d[i]); return out; }
-  const fw = Math.max(...infos.map((f) => f.fw));
-  const samples = infos.flatMap((f) => f.samples);
+  if (opt.infosOut) for (const f of infos) opt.infosOut.push({ fw: f.fw / W, chin: (f.chinY + oy) / H, cx: (f.cx + ox) / W, samples: f.samples });
+  const G = opt.faceInfos && opt.faceInfos.length ? opt.faceInfos : null;
+  if (!infos.length && !G) { for (let i = 0; i < out.d.length; i++) out.d[i] = clamp01(out.d[i]); return out; }
+  // thông số toàn thân: theo cả ảnh (G) nếu có, không thì theo các mặt trong vùng này
+  const body = G ? G.map((g) => ({ fw: g.fw * W, chinY: g.chin * H - oy, cx: g.cx * W - ox, samples: g.samples })) : infos;
+  const fw = Math.max(...body.map((f) => f.fw));
+  const samples = body.flatMap((f) => f.samples);
   const skin = skinLike(ycc(out), samples);
   let faceM = new Uint8Array(n);
   for (const f of infos) {
@@ -836,7 +1246,7 @@ export function applyPortrait(img, p, faces, personFn, roi) {
   const faceSoft = soft(dil(faceM, w, h, fw * 0.25), w, h, fw * 0.05);
   let pm = person;
   if (who !== 'all' && pm) {
-    const f = infos[0], cols = new Uint8Array(n);
+    const f = body[0], cols = new Uint8Array(n);
     const a = Math.trunc(Math.max(0, f.cx - 1.6 * f.fw)), b2 = Math.trunc(Math.min(w, f.cx + 1.6 * f.fw));
     for (let y = 0; y < h; y++) for (let x = a; x < b2; x++) cols[y * w + x] = 1;
     const cs = soft(cols, w, h, f.fw * 0.1);
@@ -855,7 +1265,7 @@ export function applyPortrait(img, p, faces, personFn, roi) {
   else tm = bodySkin ? faceAll.map((v, i) => Math.max(v, bodySkin[i])) : faceAll;
   out = skinTone(out, tm.map(clamp01), p, imp, samples, W, H);
   if (pm && ['cloth_wrinkle', 'cloth_spots', 'cloth_edges'].some((k) => p[k])) {
-    const chin = Math.trunc(Math.min(...infos.map((f) => f.chinY)) + 0.12 * fw);
+    const chin = Math.trunc(Math.min(...body.map((f) => f.chinY)) + 0.12 * fw);
     const sk35 = new Uint8Array(n); for (let i = 0; i < n; i++) sk35[i] = skin[i] > 0.35 ? 1 : 0;
     const ss = soft(sk35, w, h, fw * 0.01);
     const cm0 = new Uint8Array(n);
@@ -865,7 +1275,7 @@ export function applyPortrait(img, p, faces, personFn, roi) {
   }
   for (const i of sel) out = reshapeFace(out, faces[i], p, imp, W, H, ox, oy);
   const bs = (p.body_slim || 0) / 100 * imp;
-  if (bs > 0 && pm) out = slimBody(out, pm, Math.min(...infos.map((f) => f.chinY)), fw, bs, oy);
+  if (bs > 0 && pm) out = slimBody(out, pm, Math.min(...body.map((f) => f.chinY)), fw, bs, oy);
   for (let i = 0; i < out.d.length; i++) out.d[i] = clamp01(out.d[i]);
   return out;
 }

@@ -58,5 +58,6 @@ export const store = {
   delStyle: (name) => tx('styles', 'readwrite', (s) => s.delete(name)),
   get: (k) => tx('kv', 'readonly', (s) => s.get(k)),
   set: (k, v) => tx('kv', 'readwrite', (s) => s.put(v, k)),
+  del: (k) => tx('kv', 'readwrite', (s) => s.delete(k)),
   async persist() { try { if (navigator.storage && navigator.storage.persist) return await navigator.storage.persist(); } catch (e) { /* bỏ qua */ } return false; },
 };

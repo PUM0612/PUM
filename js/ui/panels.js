@@ -3,6 +3,7 @@ import { h, Slider, Section, toggle, select, hint, btn } from './controls.js';
 import { ColorWheel, CurveEditor } from './widgets.js';
 import { Scopes } from './scopes.js';
 import { BANDS, CROPS, LAYER_ADJ, BUILTIN_STYLES, defaultSettings, newLayer } from '../engine/settings.js';
+import { oklchColor, colorRangeWeight } from '../engine/engine.js';
 
 const CROP_LABELS = { orig: 'Gốc', '1:1': '1:1 vuông', '4:5': '4:5 dọc', '5:4': '5:4 ngang', '3:2': '3:2 ngang', '2:3': '2:3 dọc', '16:9': '16:9 ngang', '9:16': '9:16 dọc' };
 export const TABS = [
@@ -68,6 +69,7 @@ export class Panels {
     if (this.app.tool) this.app.setTool(null);
     if ((k === 'portrait' || k === 's_face') && this.app.cur) this.app.ensureFaces().then(() => this.sync());
     if (k === 's_auto') this.app.styleThumbs();
+    if (this.cadvShow && this.app.cur) this.app.requestRender(false);    // "xem vùng chọn" chỉ hiện ở tab Màu
     this.app.drawOverlay();
   }
 
@@ -155,8 +157,8 @@ export class Panels {
     this.W(ebrush);
     this.page('s_erase',
       h('div', { class: 'stitle' }, 'Chọn công cụ rồi tô lên ảnh'), etools, ebrush, einfo,
-      h('div', { class: 'grid3', style: 'margin-top:6px' }, btn('Đổi nguồn', () => app.rtNextSource()), btn('Bỏ chỗ đang chọn', () => app.rtDeleteSel()), btn('Bỏ hết', () => app.rtClear('areas'))),
-      hint('Tô kín vật cần xoá (dây điện, người qua đường, rác…) bằng 1 ngón tay; dùng 2 ngón để phóng / di chuyển ảnh. App lấp bằng vùng xung quanh — đẹp nhất trên nền trơn (trời, tường, sàn). Chưa ưng thì bấm "Đổi nguồn" hoặc ↶ để làm lại. Chạm vào chỗ đã xoá để chọn nó.'),
+      h('div', { class: 'grid3', style: 'margin-top:6px' }, btn('Thử cách khác', () => app.rtNextSource()), btn('Bỏ chỗ đang chọn', () => app.rtDeleteSel()), btn('Bỏ hết', () => app.rtClear('areas'))),
+      hint('Tô kín vật cần xoá (dây điện, người qua đường, rác…) bằng 1 ngón tay, phủ cả viền / bóng mờ của vật; dùng 2 ngón để phóng / di chuyển ảnh. Xoá vật thể dùng AI như PUM máy tính: xoá hẳn vật rồi dựng lại nền phía sau (không chép mảng ảnh chỗ khác sang). Lần đầu cần tải mô hình AI khoảng 220 MB (menu ☰ › Mô hình AI xoá vật thể). Mỗi lần xoá vài giây tới vài chục giây tuỳ iPhone. Chưa ưng thì bấm "Thử cách khác" (4 cách lấp) hoặc ↶ để làm lại. Vật quá lớn (hơn nửa khung ảnh) thì nền dựng lại có thể nhoè. Chạm vào chỗ đã xoá để chọn nó.'),
       more());
     // ---- Chân dung
     const P = (k) => ['retouch', 'portrait', k];
@@ -194,6 +196,82 @@ export class Panels {
     }
   }
   sync() { for (const w of this.widgets) w.sync(); }
+
+  // ------------------------------------------------------------ Color Editor nâng cao (panels.py _tab_color: cadv)
+  cadvRanges() { return (this.app.s && this.app.s.color_adv) || []; }
+  cadvCur() { const rs = this.cadvRanges(); return this.cadv >= 0 && this.cadv < rs.length ? rs[this.cadv] : null; }
+  // chỉ số dải đang "xem vùng chọn" (null khi tắt) — panels.cadv_show_index
+  cadvShowIndex() { return this.cadvShow && this.cur === 'color' && this.cadvCur() ? this.cadv : null; }
+  buildCadv() {
+    const app = this.app;
+    this.cadv = -1;
+    this.cadvShow = false;
+    const ap = (k) => ['color_adv', () => (this.cadvCur() ? this.cadv : -1), k];
+    const needR = () => (this.cadvCur() ? '' : 'Chưa có dải màu — bấm "Chấm màu trên ảnh" hoặc "+"');
+    const list = h('div', { class: 'cadv-list' });
+    // dải sắc độ 0..360°: vùng sáng = màu đang được chọn; kéo ngang để dời tâm dải (HueRangeBar)
+    const bar = h('canvas', { class: 'cadv-bar', width: 360, height: 28 });
+    const drawBar = () => {
+      const g = bar.getContext('2d'), r = this.cadvCur();
+      for (let x = 0; x < 360; x++) {
+        const [cr, cg, cb] = oklchColor(x + 0.5);
+        const w = r ? colorRangeWeight(x + 0.5, Math.max(r.sat_lo ?? 0, Math.min(r.sat_hi ?? 100, 50)), r) : 1;
+        const k = r ? 0.28 + 0.72 * w : 1;
+        g.fillStyle = `rgb(${Math.round(cr * k)},${Math.round(cg * k)},${Math.round(cb * k)})`;
+        g.fillRect(x, 0, 1, 28);
+      }
+      if (r) { g.fillStyle = '#fff'; g.fillRect(Math.round(r.hue) - 1, 0, 2, 28); }
+    };
+    let barDrag = false;
+    const barHue = (e) => {
+      const r = this.cadvCur(); if (!r) return;
+      const b = bar.getBoundingClientRect();
+      const hue = Math.min(359.9, Math.max(0, (e.clientX - b.left) / b.width * 360));
+      app.set(['color_adv', this.cadv, 'hue'], Math.round(hue * 10) / 10, true);
+      drawBar(); hueSl.sync();
+    };
+    bar.addEventListener('pointerdown', (e) => { if (!this.cadvCur()) return; barDrag = true; bar.setPointerCapture(e.pointerId); app.begin('Dải màu: tâm sắc độ'); barHue(e); });
+    bar.addEventListener('pointermove', (e) => { if (barDrag) barHue(e); });
+    const barEnd = () => { if (barDrag) { barDrag = false; app.end(); } };
+    bar.addEventListener('pointerup', barEnd); bar.addEventListener('pointercancel', barEnd);
+    const showT = this.W(toggle('Xem vùng chọn', () => this.cadvShow, (v) => { this.cadvShow = v; app.requestRender(false); }));
+    const rainbow = ['#ff4040', '#ffc040', '#80ff40', '#40ffc0', '#4080ff', '#c040ff', '#ff4080'];
+    const hueSl = this.S('Tâm sắc độ', ap('hue'), 0, 360, { def: 30, gradient: rainbow, dep: needR });
+    const sliders = [hueSl,
+      this.S('Độ rộng dải', ap('width'), 1, 90, { def: 18, dep: needR }),
+      this.S('Độ mềm (Smoothness)', ap('smooth'), 1, 90, { def: 22, dep: needR }),
+      this.S('Bão hoà từ', ap('sat_lo'), 0, 100, { def: 15, dep: needR }),
+      this.S('Bão hoà đến', ap('sat_hi'), 0, 100, { def: 100, dep: needR }),
+      h('div', { class: 'hint', style: 'text-align:center;color:#ddd;margin-top:6px' }, 'Chỉnh màu của dải'),
+      this.S('Sắc độ (Hue)', ap('h'), -100, 100, { dep: needR }),
+      this.S('Bão hoà', ap('s'), -100, 100, { gradient: ['#808080', '#e2403a'], dep: needR }),
+      this.S('Độ sáng', ap('l'), -100, 100, { gradient: ['#202020', '#f0f0f0'], dep: needR })];
+    const text = (i, r) => {
+      const parts = [['h', 'H'], ['s', 'S'], ['l', 'L']].filter(([k]) => Math.abs(r[k] || 0) > 0.5).map(([k, n]) => `${n} ${(r[k] > 0 ? '+' : '') + Math.round(r[k])}`);
+      return `Dải ${i + 1} · ${Math.round(r.hue || 0)}°` + (parts.length ? ' · ' + parts.join(' ') : ' (chưa chỉnh)');
+    };
+    this.W({ sync: () => {
+      const rs = this.cadvRanges();
+      if (!(this.cadv >= 0 && this.cadv < rs.length)) this.cadv = rs.length - 1;
+      list.replaceChildren(...rs.map((r, i) => {
+        const [cr, cg, cb] = oklchColor(r.hue || 0);
+        const chk = h('input', { type: 'checkbox', onclick: (e) => e.stopPropagation(),
+          onchange: (e) => { app.begin('Bật/tắt dải màu'); app.set(['color_adv', i, 'on'], e.target.checked); app.end(); } });
+        chk.checked = r.on ?? true;
+        return h('div', { class: 'cadv-item' + (i === this.cadv ? ' on' : ''), onclick: () => { this.cadv = i; this.sync(); if (this.cadvShow) app.requestRender(false); } },
+          chk, h('span', { class: 'sw', style: `background:rgb(${cr},${cg},${cb})` }), h('span', {}, text(i, r)));
+      }));
+      list.style.display = rs.length ? '' : 'none';
+      drawBar();
+    } });
+    return this.sec('Color Editor nâng cao (Advanced)', { reset: () => { app.begin('Đặt lại Color Editor nâng cao'); app.set(['color_adv'], []); app.end(); } }).add(
+      hint('Chấm một màu trên ảnh để tạo dải màu riêng (không giới hạn số dải), chỉnh độ rộng / độ mềm / khoảng bão hoà để chọn đúng màu cần sửa rồi đổi Sắc độ, Bão hoà, Độ sáng. Bật "Xem vùng chọn" để thấy màu nào đang bị chỉnh (phần còn lại thành xám).'),
+      h('div', { class: 'row' },
+        btn('Chấm màu trên ảnh', () => app.setTool(app.tool === 'cadvpick' ? null : 'cadvpick')),
+        btn('+', () => app.addColorRange(30.0, 45.0)),
+        btn('Xoá dải', () => app.removeColorRange())),
+      list, showT, bar, ...sliders);
+  }
 
   build() {
     const app = this.app;
@@ -257,6 +335,7 @@ export class Panels {
       this.sec('Color Editor (HSL từng dải màu)', { auto: auto('hsl'), reset: reset(['color']) }).add(bandBtns,
         h('div', { class: 'row' }, btn('Chọn màu từ ảnh', () => app.setTool(app.tool === 'colorpick' ? null : 'colorpick'))), bandLabel,
         this.S('Sắc độ (Hue)', bp(0), -100, 100), this.S('Bão hoà', bp(1), -100, 100), this.S('Độ sáng', bp(2), -100, 100)),
+      this.buildCadv(),
       this.sec('Tông da (Skin Tone)', { auto: auto('skin'), reset: reset(['skin']) }).add(
         hint('Kéo "Đồng nhất" để da hết loang lổ, ửng đỏ hoặc vàng không đều.'),
         this.S('Sắc độ da', ['skin', 'hue'], -100, 100), this.S('Bão hoà da', ['skin', 'sat'], -100, 100),
@@ -478,12 +557,12 @@ export class Panels {
     this.page('retouch',
       this.sec('Công cụ retouch (kiểu Capture One)').add(tools,
         mk('Cỡ cọ', 0.2, 15, 2, 'rtSize', 0.1, 1), mk('Độ cứng mép', 0, 100, 60, 'rtHard'), mk('Độ mờ đục', 0, 100, 100, 'rtOpacity'),
-        hint('Tô lên mụn / vết bẩn / vật cần xoá: app tự chọn vùng nguồn đẹp nhất và hoà liền mạch. Nét đứt là vùng nguồn — kéo nét đứt để đổi nguồn. Chạm vào vùng đã tô để chọn. Clone: chạm giữ để đặt điểm nguồn rồi tô.')),
+        hint('Heal: tô lên mụn / vết bẩn — app tự chọn vùng nguồn đẹp nhất và hoà liền mạch; nét đứt là vùng nguồn, kéo nét đứt để đổi nguồn. Xoá vật thể: AI xoá hẳn vật và dựng lại nền phía sau (như PUM máy tính, cần tải mô hình ~220 MB một lần); chưa ưng thì "Đổi nguồn / thử lại" = thử cách lấp khác. Chạm vào vùng đã tô để chọn. Clone: chạm giữ để đặt điểm nguồn rồi tô.')),
       this.sec('Làm mịn da (giữ lỗ chân lông)', { auto: () => app.auto('skin_smooth'), reset: () => app.resetPaths([['retouch', 'skin_amount'], ['retouch', 'skin_texture'], ['retouch', 'skin_auto']]) }).add(
         this.S('Độ mịn', ['retouch', 'skin_amount'], 0, 100),
         this.S('Giữ kết cấu da', ['retouch', 'skin_texture'], 0, 100, { def: 50, dep: noSkin }), auto),
       this.sec('Quản lý').add(info,
-        h('div', { class: 'grid2' }, btn('Đổi nguồn', () => app.rtNextSource()), btn('Xoá vùng chọn', () => app.rtDeleteSel()),
+        h('div', { class: 'grid2' }, btn('Đổi nguồn / thử lại', () => app.rtNextSource()), btn('Xoá vùng chọn', () => app.rtDeleteSel()),
           btn('Xoá mọi vùng heal / clone', () => app.rtClear('areas')), btn('Xoá vùng làm mịn', () => app.rtClear('skin')))));
   }
 

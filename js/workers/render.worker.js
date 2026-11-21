@@ -1,10 +1,12 @@
-﻿// Luồng dựng ảnh (Web Worker): giữ ảnh nền xem trước + bản nháp, dựng theo từng bước có bộ nhớ đệm
+// Luồng dựng ảnh (Web Worker): giữ ảnh nền xem trước + bản nháp, dựng theo từng bước có bộ nhớ đệm
 // (kéo một thanh chỉ dựng lại từ bước bị ảnh hưởng), Auto từng nhóm, xuất ảnh cỡ gốc theo dải.
 import * as E from '../engine/engine.js';
 import { mergeSettings } from '../engine/settings.js';
 import * as A from '../engine/auto.js';
 import { exportJob } from '../engine/export.js';
-import { applyRetouch, hasRetouch, findAreaSources } from '../engine/retouch.js';
+import { applyRetouch, hasRetouch, findAreaSources, xvRefDims } from '../engine/retouch.js';
+import { portraitActive } from '../engine/portrait.js';
+import * as XV from '../engine/xoa_vat.js';
 
 const cv = E.cv;
 const bases = {};          // id -> { full: img, draft: img, fullW, fullH }
@@ -54,10 +56,11 @@ function toRGBA(img) {
 const J = JSON.stringify;
 const pick = (s, keys) => keys.map((k) => s[k]);
 const STAGES = [
-  { name: 'retouch', key: (s) => J(s.retouch), run: (img, s, c) => applyRetouch(img, s.retouch, c) },
+  // xoá vật thể: kết quả AI mới về (XV.state.epoch tăng) thì dựng lại bước retouch
+  { name: 'retouch', key: (s) => J(s.retouch) + '#' + XV.state.epoch, run: (img, s, c) => applyRetouch(img, s.retouch, c) },
   { name: 'tone', key: (s) => J([s.lens.vig_corr, s.calib, s.curve, pick(s, ['temp', 'tint', 'exposure', 'dehaze', 'highlights', 'shadows', 'whites', 'blacks', 'contrast', 'brightness', 'clarity'])]),
     run: (img, s, c) => E.tone(E.vigCorr(img, s, c.roi), s) },
-  { name: 'color', key: (s) => J([s.color, s.skin, s.vibrance, s.saturation]), run: (img, s) => E.color(img, s) },
+  { name: 'color', key: (s) => J([s.color, s.color_adv, s._cadv_show ?? null, s.skin, s.vibrance, s.saturation]), run: (img, s) => E.color(img, s) },
   { name: 'grading', key: (s) => J(s.grading), run: (img, s) => E.grading(img, s.grading) },
   { name: 'layers', key: (s) => J(s.layers), run: (img, s, c) => E.applyLayers(img, s, c) },
   { name: 'detail', key: (s) => J(pick(s, ['nr_lum', 'nr_lum_detail', 'nr_lum_contrast', 'nr_color', 'nr_color_detail', 'nr_color_smooth', 'sharpen', 'sharpen_radius'])),
@@ -81,11 +84,12 @@ function runStages(base, s, ctx, cache, keepAll) {
     if (cache.imgs[i]) reuse = i;
   }
   // mọi bước trước reuse phải khớp khoá
-  if (reuse >= 0) { img = cache.imgs[reuse]; i0 = reuse + 1; }
+  if (reuse >= 0) { img = cache.imgs[reuse]; i0 = reuse + 1; if (cache.xvp) ctx.xvPending = true; }
   for (let i = i0; i < STAGES.length; i++) {
     const st = STAGES[i];
     const active = isActive(st.name, s);
     if (active) img = st.run(cv.clone(img), s, ctx);
+    if (i === 0) cache.xvp = !!ctx.xvPending;       // bước retouch còn vùng xoá đang chờ AI (lấp tạm)
     cache.keys[i] = keys[i];
     cache.imgs[i] = (keepAll === 'all' || (keepAll === 'some' && KEEP_FULL.has(st.name))) ? img : null;
   }
@@ -108,12 +112,16 @@ function renderBase(b, which, settings, geom) {
   const s = mergeSettings(settings);
   const base = which === 'draft' ? b.draft : (which === 'draft2' || which === 'thumb') ? b.draft2 : b.full;
   const scale = base.w / b.fullW;
-  const ctx = { scale, personFn: b.personFn || null, faces: b.faces || null };
+  const ctx = { scale, personFn: b.personFn || null, faces: b.faces || null, xvPhoto: b.photo, xvRef: xvRefDims(b.fullW, b.fullH), draft: which !== 'full' };
+  if (which === 'full') ctx.infosOut = [];
   const cacheKey = which;
   b.cache = b.cache || {};
   b.cache[cacheKey] = b.cache[cacheKey] || makeCache();
   let img = runStages(base, s, ctx, b.cache[cacheKey], which.startsWith('draft') ? 'all' : which === 'full' ? 'some' : 'none');
+  // nhớ thông tin khuôn mặt của bản xem trước (cho dựng theo dải: xuất cỡ gốc / phóng 1:1)
+  if (ctx.infosOut && ctx.infosOut.length) b._fi = { key: faceInfoKey(b, s), infos: ctx.infosOut };
   if (geom) img = E.geometry(img, s, geom === true);
+  b.xvPending = !!ctx.xvPending;
   return img;
 }
 
@@ -132,6 +140,21 @@ function maskOverlay(b, which, settings, geom, idx, img) {
     img.d[i] = img.d[i] * (1 - a) + a; img.d[i + 1] *= 1 - a; img.d[i + 2] *= 1 - a;
   }
   return img;
+}
+
+// thông tin từng mặt (bề rộng, cằm, mẫu màu da — chuẩn hoá theo cả ảnh) mà chân dung tính trên bản xem trước;
+// các dải ở xa mặt dùng lại để da thân / tông da / quần áo / thon người giống hệt lúc xem (portrait.applyPortrait)
+function faceInfoKey(b, s) { return JSON.stringify([s.retouch, (b.faces || []).length, !!b.personFn]); }
+function faceInfosFor(b, settings) {
+  const s = mergeSettings(settings);
+  if (!b.faces || !b.faces.length || !hasRetouch(s.retouch) || !portraitActive(s.retouch.portrait)) return null;
+  const key = faceInfoKey(b, s);
+  if (b._fi && b._fi.key === key) return b._fi.infos;
+  const out = [];
+  applyRetouch(cv.clone(b.full), s.retouch, { scale: b.full.w / b.fullW, personFn: b.personFn || null, faces: b.faces, infosOut: out,
+    xvPhoto: b.photo, xvRef: xvRefDims(b.fullW, b.fullH), draft: true });
+  b._fi = { key, infos: out };
+  return out;
 }
 
 function skinStats(b, settings) {
@@ -162,16 +185,20 @@ self.onmessage = async (ev) => {
       const k = Math.min(1, m.draftSide / Math.max(m.w, m.h));
       const draft = k < 1 ? cv.resizeArea(full, Math.max(1, Math.round(m.w * k)), Math.max(1, Math.round(m.h * k))) : full;
       const draft2 = cv.resizeArea(draft, Math.max(1, Math.round(draft.w * 0.62)), Math.max(1, Math.round(draft.h * 0.62)));
-      bases[m.id] = { full, draft, draft2, fullW: m.fullW, fullH: m.fullH };
+      bases[m.id] = { full, draft, draft2, fullW: m.fullW, fullH: m.fullH, photo: m.photo || m.id };
       cur = m.id;
       self.postMessage({ type: 'base_ok', id: m.id, req: m.req });
+    } else if (m.type === 'xv_state') {
+      // mô hình AI xoá vật thể có / không có trên máy (app báo sau khi kiểm tra / tải / xoá mô hình)
+      if (XV.state.ai !== !!m.ai) { XV.state.ai = !!m.ai; XV.state.epoch++; for (const k in bases) bases[k].cache = {}; }
+      self.postMessage({ type: 'xv_state', req: m.req });
     } else if (m.type === 'person') {
       const b = bases[m.id];
-      if (b) { b.person = m.mask; b.personFn = makePersonFn(m.mask); b.cache = {}; }
+      if (b) { b.person = m.mask; b.personFn = makePersonFn(m.mask); b.cache = {}; b._fi = null; }
       self.postMessage({ type: 'person', req: m.req });
     } else if (m.type === 'faces') {
       const b = bases[m.id];
-      if (b) { b.faces = m.faces; b.cache = {}; }
+      if (b) { b.faces = m.faces; b.cache = {}; b._fi = null; }
       self.postMessage({ type: 'faces', req: m.req });
     } else if (m.type === 'drop') {
       delete bases[m.id];
@@ -184,7 +211,7 @@ self.onmessage = async (ev) => {
       try { img = renderBase(b, m.which, m.settings, m.geom); } finally { cv.opts.FAST = false; }
       if (m.mask >= 0 && m.which !== 'before') img = maskOverlay(b, m.which, m.settings, m.geom, m.mask, cv.clone(img));
       const rgba = toRGBA(img);
-      const out = { type: 'render', req: m.req, id: m.id, which: m.which, w: img.w, h: img.h, rgba, ms: performance.now() - t0 };
+      const out = { type: 'render', req: m.req, id: m.id, which: m.which, w: img.w, h: img.h, rgba, ms: performance.now() - t0, xvPending: !!b.xvPending };
       if (m.hist) out.hist = histo(img);
       self.postMessage(out, [rgba.buffer]);
     } else if (m.type === 'auto') {
@@ -212,9 +239,15 @@ self.onmessage = async (ev) => {
     } else if (m.type === 'export_start' || m.type === 'roi_start') {
       const b = bases[m.id];
       if (b && !m.skin_stats) m.skin_stats = skinStats(b, m.settings);
-      if (b) { m.personFn = b.personFn || null; m.faces = b.faces || null; }
+      if (b) { m.personFn = b.personFn || null; m.faces = b.faces || null; m.faceInfos = faceInfosFor(b, m.settings); }
+      if (b && !m.photo) m.photo = b.photo;
       exportJob(m, self);
-    } else if (m.type === 'export_band' || m.type === 'export_cancel') {
+    } else if (m.type === 'xv_prepare') {
+      // tính (hoặc lấy lại) kết quả AI của mọi vùng xoá vật thể của ảnh, rồi báo app dựng lại
+      const b = bases[m.id];
+      if (b && !m.photo) m.photo = b.photo;
+      exportJob(m, self);
+    } else if (m.type === 'export_band' || m.type === 'export_cancel' || m.type === 'xv_ai' || m.type === 'xv_got') {
       exportJob(m, self);
     }
   } catch (e) {

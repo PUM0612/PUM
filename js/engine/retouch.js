@@ -1,9 +1,18 @@
-﻿// Retouch (engine.apply_retouch): điểm heal / clone / xoá bụi, vùng tô Heal / Clone / Xoá vật thể (hoà Poisson),
-// tự tìm vùng nguồn, làm mịn da giữ kết cấu. Chân dung tự động ở portrait.js.
+// Retouch (engine.apply_retouch) gồm:
+// - điểm heal / clone / xoá bụi; vùng tô Heal / Clone (hoà Poisson), tự tìm vùng nguồn;
+// - Xoá vật thể bằng AI (xoa_vat.js);
+// - làm mịn da giữ kết cấu.
+// Chân dung tự động ở portrait.js.
 // Mọi toạ độ chuẩn hoá theo CẢ ảnh (W x H); khi dựng một vùng (xuất theo dải) truyền ctx.roi = [ox, oy, W, H].
+// Các khoá ctx cho Xoá vật thể:
+// - xvPhoto: mã ảnh, dùng làm khoá bộ đệm kết quả AI;
+// - xvRef: cỡ ảnh tham chiếu [Wr, Hr];
+// - draft: bản nháp, không đòi AI.
+// Thiếu kết quả AI thì vùng được lấp tạm và ctx.xvPending = true.
 import * as cv from './cv.js';
 import { drawStrokes } from './layers.js';
 import { portraitActive, applyPortrait, portraitNeeds } from './portrait.js';
+import * as XV from './xoa_vat.js';
 
 const smooth = (e0, e1, x) => { let t = (x - e0) / (e1 - e0); t = t < 0 ? 0 : t > 1 ? 1 : t; return t * t * (3 - 2 * t); };
 
@@ -155,7 +164,13 @@ export function areaGeom(a, W, H, ox = 0, oy = 0) {
 }
 
 function applyArea(out, a, W, H, ox, oy) {
-  const { x0, y0, bw, bh, inside, soft } = areaGeom(a, W, H, ox, oy);
+  const geo = areaGeom(a, W, H, ox, oy);
+  if (a.kind === 'remove' && !a.off) {
+    // xoá vật thể khi không có mô hình AI (vùng tạo ở bản mới, không có vùng nguồn): lấp mượt + chi tiết quanh
+    XV.removeSync(out, a, W, H, ox, oy, geo, { fallback: true });
+    return;
+  }
+  const { x0, y0, bw, bh, inside, soft } = geo;
   const w = out.w, h = out.h;
   const off = a.off || [0, 0];
   const dx = Math.round(off[0] * W), dy = Math.round(off[1] * H);
@@ -327,11 +342,33 @@ export function applyRetouch(img, rt, ctx) {
   const skinOn = (rt.skin_amount || 0) > 0 && ((rt.skin_strokes && rt.skin_strokes.length) || rt.skin_auto);
   if ((rt.spots && rt.spots.length) || (rt.areas && rt.areas.length) || skinOn) {
     for (const sp of rt.spots || []) applySpot(img, sp, W, H, ox, oy);
-    for (const a of rt.areas || []) if (a.pts && a.pts.length && a.enabled !== false) applyArea(img, a, W, H, ox, oy);
+    const areas = rt.areas || [];
+    for (let i = 0; i < areas.length; i++) {
+      const a = areas[i];
+      if (!(a.pts && a.pts.length && a.enabled !== false)) continue;
+      if (a.kind === 'remove' && XV.state.ai) {
+        // Xoá vật thể: AI xoá hẳn rồi dựng lại nền phía sau (không chép vùng nguồn nào)
+        const geo = areaGeom(a, W, H, ox, oy);
+        const ref = (ctx && ctx.xvRef) || xvRefDims(W, H);
+        const key = ctx && ctx.xvPhoto ? XV.cacheKey(ctx.xvPhoto, rt, i, ref[0], ref[1]) : null;
+        const draft = !!(ctx && ctx.draft);
+        if (!XV.removeSync(img, a, W, H, ox, oy, geo, { key, draft })) {
+          XV.removeSync(img, a, W, H, ox, oy, geo, { key, draft: true });     // chưa có kết quả AI: lấp tạm
+          if (ctx) ctx.xvPending = true;
+        }
+      } else applyArea(img, a, W, H, ox, oy);
+    }
     if (skinOn) smoothSkin(img, skinMask(img, rt, W, H, ox, oy), rt.skin_amount, rt.skin_texture ?? 50, W);
   }
-  if (ctx && ctx.faces && portraitActive(rt.portrait)) img = applyPortrait(img, rt.portrait, ctx.faces, ctx.personFn || null, roi);
+  if (ctx && ctx.faces && portraitActive(rt.portrait))
+    img = applyPortrait(img, rt.portrait, ctx.faces, ctx.personFn || null, roi, { faceInfos: ctx.faceInfos, infosOut: ctx.infosOut });
   return img;
+}
+
+// cỡ ảnh tham chiếu cho khoá kết quả AI (= bản xem trước 2000 px của PUM máy tính)
+export function xvRefDims(W, H) {
+  const k = Math.min(1, XV.REF_SIDE / Math.max(W, H));
+  return [Math.max(1, cv.roundEven(W * k)), Math.max(1, cv.roundEven(H * k))];
 }
 
 // vùng ảnh nguồn (toạ độ điểm ảnh gốc) mà một vùng [x0,y0,x1,y1] cần để retouch đúng (gồm vùng nguồn của heal / clone)
@@ -348,6 +385,12 @@ export function retouchNeeds(rt, W, H, rect, faces) {
     if (!a.pts || !a.pts.length) continue;
     const pad = a.r * W * 2.5 + 6, xs = a.pts.map((p) => p[0] * W), ys = a.pts.map((p) => p[1] * H);
     const bb = [Math.min(...xs) - pad, Math.min(...ys) - pad, Math.max(...xs) + pad, Math.max(...ys) + pad];
+    if (a.kind === 'remove' && (XV.state.ai || !a.off)) {
+      // xoá vật thể: cần cả khung các ô đưa vào AI (bối cảnh quanh vật) + khung hoà mép / ghép chi tiết
+      const r = XV.rectNorm(a, W, H);
+      boxes.push([bb, [Math.floor(r[0] * W) - 2, Math.floor(r[1] * H) - 2, Math.ceil(r[2] * W) + 2, Math.ceil(r[3] * H) + 2]]);
+      continue;
+    }
     const off = a.off || [0, 0];
     boxes.push([bb, [bb[0] + off[0] * W, bb[1] + off[1] * H, bb[2] + off[0] * W, bb[3] + off[1] * H]]);
   }

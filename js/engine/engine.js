@@ -369,6 +369,8 @@ export function color(img, s) {
       d[j] = t[0]; d[j + 1] = t[1]; d[j + 2] = t[2];
     }
   }
+  if ((s.color_adv && s.color_adv.length) || (s._cadv_show !== undefined && s._cadv_show !== null))
+    colorAdv(img, s.color_adv || [], s._cadv_show ?? null);
   const sat = s.saturation / 100;
   if (sat) {
     for (let j = 0; j < n * 3; j += 3) {
@@ -377,6 +379,113 @@ export function color(img, s) {
     }
   }
   for (let i = 0; i < n * 3; i++) d[i] = clip01(d[i]);
+  return img;
+}
+
+// ------------------- Color Editor nâng cao (Advanced, kiểu Capture One) — engine._color_adv -------------------
+// Mỗi dải màu tự chọn: tâm sắc độ + độ rộng + độ mềm + khoảng bão hoà; chỉnh Hue / Bão hoà / Độ sáng.
+// Tính trong không gian OkLCh (đều theo cảm nhận) nên đổi màu mượt, không vỡ vệt như HSV.
+export const CADV_CMAX = 0.26;            // độ bão hoà OkLCh ứng với 100%
+const F = Math.fround;
+const M_LMS = [[0.4122214708, 0.5363325363, 0.0514459929], [0.2119034982, 0.6806995451, 0.1073969566],
+  [0.0883024619, 0.2817188376, 0.6299787005]].map((r) => r.map(F));
+const M_LAB = [[0.2104542553, 0.7936177850, -0.0040720468], [1.9779984951, -2.4285922050, 0.4505937099],
+  [0.0259040371, 0.7827717662, -0.8086757660]].map((r) => r.map(F));
+const M_LAB_INV = inv3(M_LAB).map((r) => r.map(F));
+const M_LMS_INV = inv3(M_LMS).map((r) => r.map(F));
+let _SRGB_IN = null, _SRGB_OUT = null;
+function srgbLuts() {
+  if (!_SRGB_IN) {
+    _SRGB_IN = new Float32Array(4096);
+    for (let i = 0; i < 4096; i++) { const x = i / 4095; _SRGB_IN[i] = x <= 0.04045 ? x / 12.92 : Math.pow((x + 0.055) / 1.055, 2.4); }
+    _SRGB_OUT = new Float32Array(32768);       // dày hơn: vùng tối không bị vệt bậc thang
+    for (let i = 0; i < 32768; i++) { const x = i / 32767; _SRGB_OUT[i] = x <= 0.0031308 ? x * 12.92 : 1.055 * Math.pow(x, 1 / 2.4) - 0.055; }
+  }
+  return [_SRGB_IN, _SRGB_OUT];
+}
+// một điểm RGB 0..1 -> OkLab (ghi vào out[0..2])
+function okLab1(r, g, b, lutIn, out) {
+  const a0 = lutAt(lutIn, clip01(r)), a1 = lutAt(lutIn, clip01(g)), a2 = lutAt(lutIn, clip01(b));
+  const l = Math.cbrt(Math.max(F(a0 * M_LMS[0][0] + a1 * M_LMS[0][1] + a2 * M_LMS[0][2]), 0));
+  const m = Math.cbrt(Math.max(F(a0 * M_LMS[1][0] + a1 * M_LMS[1][1] + a2 * M_LMS[1][2]), 0));
+  const s = Math.cbrt(Math.max(F(a0 * M_LMS[2][0] + a1 * M_LMS[2][1] + a2 * M_LMS[2][2]), 0));
+  out[0] = F(l * M_LAB[0][0] + m * M_LAB[0][1] + s * M_LAB[0][2]);
+  out[1] = F(l * M_LAB[1][0] + m * M_LAB[1][1] + s * M_LAB[1][2]);
+  out[2] = F(l * M_LAB[2][0] + m * M_LAB[2][1] + s * M_LAB[2][2]);
+}
+function okRgb1(L, a, b, lutOut, out) {
+  const l = Math.pow(F(L * M_LAB_INV[0][0] + a * M_LAB_INV[0][1] + b * M_LAB_INV[0][2]), 3);
+  const m = Math.pow(F(L * M_LAB_INV[1][0] + a * M_LAB_INV[1][1] + b * M_LAB_INV[1][2]), 3);
+  const s = Math.pow(F(L * M_LAB_INV[2][0] + a * M_LAB_INV[2][1] + b * M_LAB_INV[2][2]), 3);
+  out[0] = lutAt(lutOut, clip01(F(l * M_LMS_INV[0][0] + m * M_LMS_INV[0][1] + s * M_LMS_INV[0][2])));
+  out[1] = lutAt(lutOut, clip01(F(l * M_LMS_INV[1][0] + m * M_LMS_INV[1][1] + s * M_LMS_INV[1][2])));
+  out[2] = lutAt(lutOut, clip01(F(l * M_LMS_INV[2][0] + m * M_LMS_INV[2][1] + s * M_LMS_INV[2][2])));
+}
+
+// (sắc độ 0..360, bão hoà 0..100, độ sáng 0..100) của một màu RGB 0..1 — dùng cho ống chọn màu (engine.oklch_of)
+export function oklchOf(rgb) {
+  const t = new Float32Array(3);
+  okLab1(rgb[0], rgb[1], rgb[2], srgbLuts()[0], t);
+  return [pmod(Math.atan2(t[2], t[1]) * 180 / Math.PI, 360), Math.min(100, Math.hypot(t[1], t[2]) / CADV_CMAX * 100), t[0] * 100];
+}
+
+// Màu hiển thị (r, g, b 0..255) của một sắc độ OkLCh — panels.hue_color
+export function oklchColor(hue, L = 0.72, C = 0.13) {
+  const th = hue * Math.PI / 180, o = new Float32Array(3);
+  okRgb1(F(L), F(C * Math.cos(th)), F(C * Math.sin(th)), srgbLuts()[1], o);
+  return [Math.round(o[0] * 255), Math.round(o[1] * 255), Math.round(o[2] * 255)];
+}
+
+// Dải màu mới cho Color Editor nâng cao (khởi tạo quanh màu vừa chấm) — engine.new_color_range
+export function newColorRange(hue = 30.0, sat = 50.0) {
+  return { on: true, hue: pmod(Number(hue), 360), width: 18.0, smooth: 22.0,
+    sat_lo: Math.max(0, Math.round(sat * 0.35)), sat_hi: 100.0, h: 0.0, s: 0.0, l: 0.0 };
+}
+
+// Mức chọn 0..1 của một dải: Hd = sắc độ (độ), Cp = bão hoà (0..100) — engine.color_range_weight
+export function colorRangeWeight(Hd, Cp, r) {
+  const d = Math.abs(pmod(Hd - (r.hue ?? 0) + 180, 360) - 180);
+  const w0 = r.width ?? 18.0, sm = Math.max(0.5, r.smooth ?? 22.0);
+  const wh = 1 - smooth(w0, w0 + sm, d);
+  const lo = r.sat_lo ?? 0, hi = r.sat_hi ?? 100, soft = 4.0 + 0.15 * sm;
+  let ws = lo > 0 ? smooth(lo - soft, lo + soft, Cp) : 1;
+  if (hi < 100) ws *= 1 - smooth(hi - soft, hi + soft, Cp);
+  return F(wh * ws);
+}
+
+export function colorAdv(img, ranges, show = null) {
+  const active = ranges.filter((r) => (r.on ?? true) && ['h', 's', 'l'].some((k) => Math.abs(r[k] || 0) > 1e-6));
+  if (!active.length && show === null) return img;
+  const [lutIn, lutOut] = srgbLuts();
+  const d = img.d, n = img.w * img.h, t = new Float32Array(3), o = new Float32Array(3);
+  const showR = show !== null && show >= 0 && show < ranges.length ? ranges[show] : null;
+  for (let i = 0, j = 0; i < n; i++, j += 3) {
+    const r0 = d[j], g0 = d[j + 1], b0 = d[j + 2];
+    okLab1(r0, g0, b0, lutIn, t);
+    const L = t[0], C = F(Math.hypot(t[1], t[2]));
+    const Hd = F(pmod(F(Math.atan2(t[2], t[1]) * 180 / Math.PI), 360)), Cp = F(C / CADV_CMAX * 100);
+    if (active.length) {
+      let dh = 0, kc = 1, dl = 0;
+      for (const r of active) {
+        const w = colorRangeWeight(Hd, Cp, r);
+        if (r.h) dh += w * (r.h / 100 * 30);
+        if (r.s) kc *= 1 + w * (r.s / 100);
+        // đổi độ sáng mạnh ở màu đậm, nhẹ ở màu nhạt (giữ vùng gần xám không bị loang)
+        if (r.l) dl += w * (r.l / 100) * 0.22 * Math.min(1, Math.max(0.25, Cp / 25));
+      }
+      const th = (Hd + dh) * Math.PI / 180;
+      const C2 = C * Math.min(3, Math.max(0, kc));
+      const L2 = clip01(L + dl * (dl > 0 ? 1 - L : L) * 1.6);
+      okRgb1(L2, C2 * Math.cos(th), C2 * Math.sin(th), lutOut, o);
+    } else { o[0] = r0; o[1] = g0; o[2] = b0; }
+    if (showR) {
+      // xem vùng đang chọn: màu được chọn hiện màu GỐC, phần còn lại thành xám (như Capture One)
+      const w = colorRangeWeight(Hd, Cp, showR);
+      const g = r0 * 0.2126 + g0 * 0.7152 + b0 * 0.0722;
+      o[0] = g + (r0 - g) * w; o[1] = g + (g0 - g) * w; o[2] = g + (b0 - g) * w;
+    }
+    d[j] = clip01(o[0]); d[j + 1] = clip01(o[1]); d[j + 2] = clip01(o[2]);
+  }
   return img;
 }
 
@@ -568,29 +677,59 @@ function rng(seed) {
   let s = seed >>> 0 || 1;
   return () => { s ^= s << 13; s >>>= 0; s ^= s >>> 17; s ^= s << 5; s >>>= 0; return (s >>> 0) / 4294967296; };
 }
-export function grain(img, s, scale, roi) {
-  const g = s.grain / 100;
-  if (!g) return img;
-  const n = img.w * img.h;
-  const rnd = rng(roi ? 12345 + Math.trunc(roi[1]) * 7919 + Math.trunc(roi[0]) : 12345);
-  let noise = cv.img1(img.w, img.h);
+function gaussNoise(w, h, rnd) {
+  const n = w * h, noise = cv.img1(w, h);
   for (let i = 0; i < n; i += 2) {
     const u = Math.max(rnd(), 1e-12), v = rnd(), r = Math.sqrt(-2 * Math.log(u));
     noise.d[i] = r * Math.cos(2 * Math.PI * v);
     if (i + 1 < n) noise.d[i + 1] = r * Math.sin(2 * Math.PI * v);
   }
-  const sig = Math.max(0, (0.4 + s.grain_size / 100 * 2.5) * Math.max(scale, 0.25) - 0.3);
-  if (sig > 0.3) {
-    noise = cv.gaussianBlur(noise, sig);
-    let m = 0, q = 0;
-    for (let i = 0; i < n; i++) { m += noise.d[i]; q += noise.d[i] * noise.d[i]; }
-    m /= n; const sd = Math.sqrt(Math.max(q / n - m * m, 0));
-    for (let i = 0; i < n; i++) noise.d[i] /= Math.max(1e-6, sd);
+  return noise;
+}
+function stdOf(a) {
+  let m = 0, q = 0;
+  for (let i = 0; i < a.length; i++) { m += a[i]; q += a[i] * a[i]; }
+  m /= a.length;
+  return Math.sqrt(Math.max(q / a.length - m * m, 0));
+}
+function blurNorm(noise, sig) {
+  if (sig <= 0.3) return noise;
+  const out = cv.gaussianBlur(noise, sig), sd = Math.max(1e-6, stdOf(out.d));
+  for (let i = 0; i < out.d.length; i++) out.d[i] /= sd;
+  return out;
+}
+// engine._grain_factor: tỉ lệ độ đậm hạt ở ảnh thu nhỏ `scale` so với hạt gốc khi chính hạt gốc bị thu nhỏ về cùng
+// cỡ (đo bằng mô phỏng, nhớ kết quả). 1.0 khi scale >= 1 -> ảnh vừa khung trông giống lúc phóng 100% và ảnh xuất.
+const _GRAIN_K = new Map();
+export function grainFactor(scale, sigFull) {
+  if (scale >= 0.999) return 1.0;
+  const key = `${scale.toFixed(3)}|${sigFull.toFixed(3)}`;
+  let v = _GRAIN_K.get(key);
+  if (v === undefined) {
+    const rnd = rng(7), N = 512;
+    const full = blurNorm(gaussNoise(N, N, rnd), Math.max(0, sigFull - 0.3));
+    const n = Math.max(8, Math.round(N * scale));
+    const target = stdOf(cv.resizeArea(full, n, n).d);
+    const prev = blurNorm(gaussNoise(n, n, rnd), Math.max(0, sigFull * Math.max(scale, 0.25) - 0.3));
+    v = target / Math.max(1e-6, stdOf(prev.d));
+    _GRAIN_K.set(key, v);
   }
+  return v;
+}
+
+export function grain(img, s, scale, roi) {
+  const g = s.grain / 100;
+  if (!g) return img;
+  const n = img.w * img.h;
+  const rnd = rng(roi ? 12345 + Math.trunc(roi[1]) * 7919 + Math.trunc(roi[0]) : 12345);
+  const sigFull = 0.4 + s.grain_size / 100 * 2.5;          // cỡ hạt tính theo điểm ảnh GỐC (như ảnh xuất)
+  const noise = blurNorm(gaussNoise(img.w, img.h, rnd), Math.max(0, sigFull * Math.max(scale, 0.25) - 0.3));
+  // ảnh nhỏ hơn gốc (bản xem trước): hạt gốc bị thu nhỏ sẽ nhạt đi -> giảm biên độ cho đúng như vậy
+  const ampK = grainFactor(scale, sigFull);
   const d = img.d;
   for (let i = 0, j = 0; i < n; i++, j += 3) {
     const L = d[j] * 0.2126 + d[j + 1] * 0.7152 + d[j + 2] * 0.0722;
-    const a = noise.d[i] * g * 0.09 * (0.35 + 4 * L * (1 - L));
+    const a = noise.d[i] * g * 0.09 * ampK * (0.35 + 4 * L * (1 - L));
     d[j] = clip01(d[j] + a); d[j + 1] = clip01(d[j + 1] + a); d[j + 2] = clip01(d[j + 2] + a);
   }
   return img;

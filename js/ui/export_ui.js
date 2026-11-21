@@ -166,7 +166,7 @@ export async function openExportSheet(app, mode = {}) {
 export function runExport(app, opts, onProg, photoArg) {
   const job = 'j' + Date.now().toString(36);
   const t0 = performance.now();
-  const p = photoArg || { id: app.cur.id, name: app.cur.name, settings: app.s, bitmap: app.bitmap, W: app.fullW, H: app.fullH };
+  const p = photoArg || { id: app.cur.id, name: app.cur.name, settings: app.s, bitmap: app.bitmap, W: app.fullW, H: app.fullH, photo: app.cur.fileId || app.cur.id };
   return new Promise((res, rej) => {
     const chunks = [];
     let outW = 0, outH = 0;
@@ -195,6 +195,6 @@ export function runExport(app, opts, onProg, photoArg) {
       } catch (e) { done(); rej(e); }
     });
     app.worker.postMessage({ type: 'export_start', job, id: p.id, settings: JSON.parse(JSON.stringify(p.settings)), W: p.W, H: p.H,
-      opts: { long_edge: opts.long_edge, quality: opts.quality } });
+      opts: { long_edge: opts.long_edge, quality: opts.quality }, photo: p.photo });
   });
 }

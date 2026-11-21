@@ -1,4 +1,4 @@
-﻿// Dựng theo vùng ở độ phân giải gốc (giống engine.render_roi của PUM máy tính):
+// Dựng theo vùng ở độ phân giải gốc (giống engine.render_roi của PUM máy tính):
 // - Xuất ảnh cỡ gốc THEO DẢI: mỗi dải lấy đúng vùng nguồn cần (+ lề đủ bán kính các hiệu ứng), dựng, nắn khung,
 //   mã hoá JPEG ngay — không giữ ảnh số thực cỡ gốc trong bộ nhớ.
 // - Phóng 1:1 nét: dựng đúng vùng đang xem.
@@ -6,20 +6,86 @@
 import * as E from './engine.js';
 import { mergeSettings, lensActive } from './settings.js';
 import { JpegEncoder } from './jpeg.js';
-import { applyRetouch, hasRetouch, retouchNeeds } from './retouch.js';
+import { applyRetouch, hasRetouch, retouchNeeds, areaGeom, xvRefDims } from './retouch.js';
+import * as XV from './xoa_vat.js';
 
 const cv = E.cv;
 const jobs = {};
 
 export function exportJob(m, port) {
-  if (m.type === 'export_band') {
-    const j = jobs[m.job];
-    if (j && j.wait) { const f = j.wait; j.wait = null; f(m); }
+  if (m.type === 'export_band' || m.type === 'xv_ai' || m.type === 'xv_got') {
+    const j = jobs[m.job], slot = m.type === 'export_band' ? 'wait' : 'waitXv';
+    if (j && j[slot]) { const f = j[slot]; j[slot] = null; f(m); }
     return;
   }
   if (m.type === 'export_cancel') { if (jobs[m.job]) jobs[m.job].cancel = true; return; }
-  const fn = m.type === 'roi_start' ? runRoi : run;
-  fn(m, port).catch((e) => port.postMessage({ type: m.type === 'roi_start' ? 'roi_done' : 'export_done', job: m.job, error: String(e && e.stack || e) }));
+  const fn = m.type === 'roi_start' ? runRoi : m.type === 'xv_prepare' ? runXv : run;
+  const done = m.type === 'roi_start' ? 'roi_done' : m.type === 'xv_prepare' ? 'xv_done' : 'export_done';
+  fn(m, port).catch((e) => { delete jobs[m.job]; port.postMessage({ type: done, job: m.job, error: String(e && e.stack || e) }); });
+}
+
+// ------------------------------------------------------------------ Xoá vật thể bằng AI
+// Hỏi luồng chính một việc của AI (chạy mô hình / đọc kết quả đã lưu) và chờ trả lời.
+function askXv(job, port, msg, transfer) {
+  return new Promise((res, rej) => {
+    if (jobs[job].cancel) { rej(new Error('đã huỷ')); return; }
+    jobs[job].waitXv = res;
+    port.postMessage(Object.assign({ job }, msg), transfer || []);
+  });
+}
+
+// Tính kết quả AI cho mọi vùng xoá vật thể của ảnh (P.s, ảnh gốc P.W x P.H) chưa có trong bộ đệm.
+// Như PUM máy tính:
+// - ảnh vào mô hình lấy ở độ phân giải tham chiếu (cạnh dài 2000 px);
+// - các ô AI được tính trên ảnh đã áp những điểm / vùng retouch đứng TRƯỚC vùng đó.
+// Kết quả lưu vào bộ đệm của luồng dựng, gửi cả cho app để lưu bền (IndexedDB) -> mở lại app không phải chạy AI.
+async function xvPrepare(job, port, P) {
+  const rt = P.s.retouch;
+  if (!XV.state.ai || !rt || !(rt.areas || []).some((a) => a.kind === 'remove' && a.pts && a.pts.length && a.enabled !== false)) return 0;
+  const W = P.W, H = P.H, [Wr, Hr] = xvRefDims(W, H), kx = W / Wr, ky = H / Hr;
+  let n = 0;
+  for (let i = 0; i < rt.areas.length; i++) {
+    const a = rt.areas[i];
+    if (!(a.kind === 'remove' && a.pts && a.pts.length && a.enabled !== false)) continue;
+    const key = XV.cacheKey(P.photo, rt, i, Wr, Hr);
+    if (!key || XV.cacheHas(key)) continue;
+    const got = await askXv(job, port, { type: 'xv_get', key });
+    if (got.entry) { XV.cachePut(key, got.entry); XV.state.epoch++; continue; }
+    // ảnh trước vùng này ở độ phân giải tham chiếu, phủ đủ khung các ô AI (+ vùng nguồn của retouch trước đó)
+    const pre = Object.assign({}, rt, { areas: rt.areas.slice(0, i), skin_amount: 0 });
+    const rn = XV.rectNorm(a, Wr, Hr);
+    const [x0, y0, x1, y1] = retouchNeeds(pre, Wr, Hr, [Math.floor(rn[0] * Wr), Math.floor(rn[1] * Hr), Math.ceil(rn[2] * Wr), Math.ceil(rn[3] * Hr)], null);
+    const cw = x1 - x0, ch = y1 - y0;
+    if (cw < 2 || ch < 2) continue;
+    const src = await need(job, port, [x0 * kx, y0 * ky, cw * kx, ch * ky], cw, ch);
+    let img = { w: cw, h: ch, c: 3, d: new Float32Array(cw * ch * 3) };
+    const u = src.rgba;
+    for (let q = 0, j = 0; q < cw * ch; q++, j += 4) { img.d[q * 3] = u[j] / 255; img.d[q * 3 + 1] = u[j + 1] / 255; img.d[q * 3 + 2] = u[j + 2] / 255; }
+    const roi = [x0, y0, Wr, Hr];
+    if (hasRetouch(pre)) img = applyRetouch(img, pre, { roi, xvPhoto: P.photo, xvRef: [Wr, Hr] });
+    const tiles = await XV.removeAsync(img, a, Wr, Hr, x0, y0, areaGeom(a, Wr, Hr, x0, y0), { key }, async (inp, m) => {
+      port.postMessage({ type: 'xv_progress', job, area: i });
+      const r = await askXv(job, port, { type: 'xv_run', inp, m }, [inp.buffer, m.buffer]);
+      if (r.error) throw new Error(r.error);
+      return r.L;
+    });
+    if (tiles) {
+      XV.state.epoch++;
+      n++;
+      port.postMessage({ type: 'xv_put', job, key, entry: { tiles } });
+    }
+  }
+  return n;
+}
+
+async function runXv(m, port) {
+  const job = m.job;
+  jobs[job] = {};
+  const P = prep(m);
+  const t0 = performance.now();
+  const n = await xvPrepare(job, port, P);
+  port.postMessage({ type: 'xv_done', job, n, ms: performance.now() - t0 });
+  delete jobs[job];
 }
 
 function need(job, port, rect, tw, th) {
@@ -34,7 +100,8 @@ function prep(m) {
   const s = mergeSettings(m.settings);
   const W = m.W, H = m.H;
   const G = E.geometryAffine(W, H, s, true);
-  return { s, W, H, G, Ai: E.inv3(G.M), lensOn: lensActive(s.lens), sr: Object.assign({}, s), noise: null, skin: m.skin_stats, personFn: m.personFn, faces: m.faces };
+  return { s, W, H, G, Ai: E.inv3(G.M), lensOn: lensActive(s.lens), sr: Object.assign({}, s), noise: null, skin: m.skin_stats, personFn: m.personFn, faces: m.faces,
+    faceInfos: m.faceInfos || null, photo: m.photo || m.id };
 }
 
 // dựng vùng ảnh ra [ox0, ox0+nw) x [oy0, oy0+rows) (toạ độ ảnh ra ở tỉ lệ ds) -> ảnh số thực
@@ -74,7 +141,7 @@ async function renderRect(job, port, P, ds, ox0, oy0, nw, rows) {
     const roi = [sx0 * fx, sy0 * fy, W * fx, H * fy];
     sr._ref_w = W * fx;
     if (P.skin) sr._skin_stats = P.skin;
-    if (hasRetouch(s.retouch)) img = applyRetouch(img, s.retouch, { roi, faces: P.faces, personFn: P.personFn });
+    if (hasRetouch(s.retouch)) img = applyRetouch(img, s.retouch, { roi, faces: P.faces, personFn: P.personFn, faceInfos: P.faceInfos, xvPhoto: P.photo, xvRef: xvRefDims(W, H) });
     img = E.adjustA(img, sr, { roi, personFn: P.personFn || null });
     if (s.nr_lum) {
       if (P.noise == null) {
@@ -118,6 +185,7 @@ async function run(m, port) {
   const job = m.job;
   jobs[job] = {};
   const P = prep(m);
+  await xvPrepare(job, port, P);          // xoá vật thể: có đủ kết quả AI trước khi dựng các dải
   const { s, W, G } = P;
   const OW = G.w, OH = G.h;
   const le = m.opts.long_edge | 0;
@@ -155,6 +223,7 @@ async function runRoi(m, port) {
   const job = m.job;
   jobs[job] = {};
   const P = prep(m);
+  await xvPrepare(job, port, P);
   const ds = Math.min(1, m.ds || 1);
   const [x0, y0, x1, y1] = m.rect;
   const ox0 = Math.floor(x0 * ds), oy0 = Math.floor(y0 * ds);

@@ -48,6 +48,7 @@ export function defaultSettings() {
     clarity: 0.0, dehaze: 0.0, vibrance: 0.0, saturation: 0.0,
     curve: { rgb: ident(), r: ident(), g: ident(), b: ident() },
     color,
+    color_adv: [],
     skin: { hue: 0.0, sat: 0.0, lum: 0.0, uni_hue: 0.0, uni_sat: 0.0, uni_lum: 0.0 },
     sharpen: 0.0, sharpen_radius: 1.0,
     nr_lum: 0.0, nr_lum_detail: 50.0, nr_lum_contrast: 0.0,
@@ -132,6 +133,8 @@ export function blendStyle(current, style, strength = 1.0, includeRetouch = fals
       for (const [ch, pts] of Object.entries(sv)) cur.curve[ch] = pts.map(([x, y]) => [x, x + (y - x) * k]);
     } else if (key === 'color') {
       for (const [band, vals] of Object.entries(sv)) cur.color[band] = vals.map((v) => v * k);
+    } else if (key === 'color_adv') {
+      cur.color_adv = (sv || []).map((r) => ({ ...deepCopy(r), h: (r.h || 0) * k, s: (r.s || 0) * k, l: (r.l || 0) * k }));
     } else if (key === 'skin') {
       for (const [sk, v] of Object.entries(sv)) cur.skin[sk] = v * k;
     } else if (key === 'calib') {

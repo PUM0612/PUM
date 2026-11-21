@@ -1,6 +1,9 @@
 // Service worker PUM iPhone — tạo tự động bởi tools/phat_hanh.py (đừng sửa tay).
 // Đổi phiên bản (js/version.js) rồi chạy lại phat_hanh.py: iPhone tự tải bản mới ở lần mở kế tiếp.
-const CACHE = 'pum-1.1.1';
+// Gắn COOP / COEP vào mọi trang + tệp (GitHub Pages không cho đặt header): trang "cô lập" -> AI xoá vật thể chạy
+// được nhiều luồng. Mô hình AI (models/lama/) không nằm trong bộ đệm này: app tự tải khi người dùng đồng ý và giữ ở
+// bộ đệm riêng "ai-lama-..." (không bị xoá khi cập nhật app).
+const CACHE = 'pum-1.1.1-cfac534e';
 const FILES = [
   "./",
   "index.html",
@@ -10,6 +13,7 @@ const FILES = [
   "js/decode.js",
   "js/store.js",
   "js/version.js",
+  "js/xoa_ai.js",
   "js/engine/auto.js",
   "js/engine/cv.js",
   "js/engine/engine.js",
@@ -19,6 +23,7 @@ const FILES = [
   "js/engine/portrait.js",
   "js/engine/retouch.js",
   "js/engine/settings.js",
+  "js/engine/xoa_vat.js",
   "js/ui/controls.js",
   "js/ui/export_ui.js",
   "js/ui/library.js",
@@ -27,6 +32,7 @@ const FILES = [
   "js/ui/viewer.js",
   "js/ui/widgets.js",
   "js/workers/render.worker.js",
+  "js/workers/xoa_ai.worker.js",
   "css/app.css",
   "icons/apple-touch-icon.png",
   "icons/icon-192.png",
@@ -45,6 +51,14 @@ const FILES = [
   "models/face_landmarker.task",
   "models/pose_landmarker_full.task"
 ];
+function coi(res) {
+  if (!res || res.status === 0 || res.type === 'opaque' || res.type === 'opaqueredirect') return res;
+  const h = new Headers(res.headers);
+  h.set('Cross-Origin-Opener-Policy', 'same-origin');
+  h.set('Cross-Origin-Embedder-Policy', 'require-corp');
+  h.set('Cross-Origin-Resource-Policy', 'same-origin');
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers: h });
+}
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(FILES)).then(() => self.skipWaiting()));
 });
@@ -55,8 +69,12 @@ self.addEventListener('activate', (e) => {
 self.addEventListener('fetch', (e) => {
   const req = e.request;
   if (req.method !== 'GET' || new URL(req.url).origin !== location.origin) return;
+  if (new URL(req.url).pathname.includes('/models/lama/')) {
+    e.respondWith(caches.match(req).then((hit) => hit || fetch(req)).then(coi));
+    return;
+  }
   e.respondWith(caches.match(req, { ignoreSearch: true }).then((hit) => hit || fetch(req).then((res) => {
     if (res.ok && res.type === 'basic') { const cp = res.clone(); caches.open(CACHE).then((c) => c.put(req, cp)); }
     return res;
-  }).catch(() => caches.match('index.html'))));
+  }).catch(() => caches.match('index.html'))).then(coi));
 });

@@ -3,4 +3,12 @@
   Dùng: index.js, worker.js, libraw.js, libraw.wasm (thư mục dist của gói).
 - mediapipe-tasks-vision-1.2.3/ — npm @mediapipe/tasks-vision@1.2.3 (Apache-2.0), tải từ registry.npmjs.org.
   Dùng: vision_bundle.mjs, wasm/vision_wasm_internal.js, wasm/vision_wasm_internal.wasm.
+- onnxruntime-web-1.31.1/ — npm onnxruntime-web@1.31.1 (giấy phép MIT, Microsoft), tải từ cdn.jsdelivr.net ngày
+  21/11/2026 (người dùng đồng ý; 14 927 315 byte). Dùng: dist/ort.wasm.min.mjs, dist/ort-wasm-simd-threaded.mjs,
+  dist/ort-wasm-simd-threaded.wasm. Cùng phiên bản onnxruntime mà PUM máy tính dùng (1.31.1).
 Mô hình AI (models/): face_landmarker.task, pose_landmarker_full.task — chép từ "PUM Mã Nguồn/models" (giống bản máy tính).
+- models/lama/lama_fp32.onnx.1 … .5 — mô hình Xoá vật thể: chép nguyên lama_fp32.onnx của PUM máy tính.
+  - Nguồn: big-lama, bản ONNX Carve/LaMa-ONNX, giấy phép Apache 2.0.
+  - Lấy từ "Bản Demo 2/PUM Mã Nguồn (bản phát triển)/models".
+  - Cắt làm 5 phần < 50 MB để đăng lên GitHub. Ghép lại: 208 044 816 byte, sha256 1faef530…68d6.
+  - KHÔNG nằm trong bộ đệm offline của app; app tải khi người dùng đồng ý (js/xoa_ai.js).

@@ -70,9 +70,10 @@ export function openLibrary(app) {
     btn('Chọn tất cả (đang lọc)', () => { st.multi = true; for (const p of visible()) st.sel.add(p.id); draw(); }),
     btn('Bỏ chọn', () => { st.sel.clear(); draw(); }),
     btn('Bản sao ảo', () => act((ps) => virtualCopies(app, ps), 'Đã tạo bản sao ảo')),
-    btn('So sánh 2–4 ảnh', () => { const ps = targets(); if (ps.length < 2 || ps.length > 4) return app.toast('Chọn 2 đến 4 ảnh để so sánh'); compare(app, ps); }),
+    btn('So sánh (1 ảnh: trước / sau)', () => { const ps = targets(); if (!ps.length || ps.length > 4) return app.toast('Chọn 1 ảnh (so trước / sau) hoặc 2 đến 4 ảnh để so sánh'); compare(app, ps); }),
     btn('Áp style cho ảnh chọn', () => styleMany(app, targets(), draw)),
     btn('Dán chỉnh sửa cho ảnh chọn', () => pasteMany(app, targets(), draw)),
+    btn('Đặt lại ảnh chọn…', () => { const ps = targets(); if (!ps.length) return app.toast('Chưa chọn ảnh nào'); app.openResetMenu(ps); }),
     btn('Xuất hàng loạt', () => { const ps = targets(); if (!ps.length) return app.toast('Chưa chọn ảnh nào'); batchExport(app, ps); }),
     btn('Gỡ ảnh chọn khỏi app', () => removeMany(app, targets(), draw)),
     btn('Tự lọc: mờ / nhắm mắt / trùng', () => autoCull(app, st.sel.size ? targets() : visible(), draw)));
@@ -146,22 +147,102 @@ async function pasteMany(app, ps, draw) {
   draw();
 }
 
-// ---------------------------------------------------------------- so sánh 2–4 ảnh
-async function compare(app, ps) {
-  const wrap = h('div', { class: 'cmp' + (ps.length > 2 ? ' four' : '') });
-  app.openSheet('So sánh', h('div', {}, wrap, hint('Chạm vào một ảnh để mở ảnh đó.')), true);
-  for (const p of ps) {
-    const c = h('canvas'); const cell = h('div', { class: 'cmpcell', onclick: () => { app.closeSheet(); app.openPhoto(p); } }, c, h('div', { class: 'nm' }, p.name + ' ' + '★'.repeat(p.rating || 0)));
-    wrap.append(cell);
+// ---------------------------------------------------------------- so sánh
+// Chọn 1 ảnh: so CÙNG MỘT MÃ ẢNH — có bản sao ảo thì so ảnh gốc với các bản sao, không thì trái = trước khi chỉnh
+// (thông số mặc định, giữ khung cắt / xoay), phải = sau khi chỉnh (MainWindow.compare_same bản máy tính).
+// Chọn 2–4 ảnh: so các ảnh khác nhau.
+const GEOM_KEYS = ['rotate', 'straighten', 'crop', 'crop_rect', 'flip', 'lens', 'crop_outside'];
+function compareTargets(app, ps) {
+  if (ps.length !== 1) return ps.map((p) => ({ p, label: p.name + ' ' + '★'.repeat(p.rating || 0) }));
+  const p = ps[0], fid = p.fileId || p.id;
+  const same = app.photos.filter((q) => (q.fileId || q.id) === fid).sort((a, b) => (a.added || 0) - (b.added || 0));
+  if (same.length > 1)
+    return same.slice(0, 4).map((q) => ({ p: q, label: (q.vc ? 'Bản sao ảo' : 'Ảnh gốc') + ' ' + '★'.repeat(q.rating || 0) }));
+  const s = S.mergeSettings(app.cur && app.cur.id === p.id ? app.s : p.settings), before = S.defaultSettings();
+  for (const k of GEOM_KEYS) before[k] = S.deepCopy(s[k]);
+  return [{ p, label: 'Trước khi chỉnh', settings: before }, { p, label: 'Sau khi chỉnh' }];
+}
+export async function compare(app, ps) {
+  const items = compareTargets(app, ps);
+  const wrap = h('div', { class: 'cmp' + (items.length > 2 ? ' four' : '') });
+  const z = { k: 1, x: 0, y: 0 };            // phóng / kéo ĐỒNG BỘ mọi ô (cùng điểm, cùng mức)
+  // vẽ theo khung hình: nhiều lần chạm di chuyển trong một khung chỉ đổi transform một lần (mượt, không trễ dồn)
+  let raf = 0, cells = null;
+  const apply = () => {
+    if (raf) return;
+    raf = requestAnimationFrame(() => {
+      raf = 0;
+      const t = `translate3d(${z.x}px,${z.y}px,0) scale(${z.k})`;
+      for (const c of cells || (cells = [...wrap.querySelectorAll('canvas')])) c.style.transform = t;
+    });
+  };
+  let box = null;                            // cỡ ô (không phóng), đo một lần lúc chạm -> không đo lại khi kéo
+  const clampZ = () => {
+    z.k = Math.min(8, Math.max(1, z.k));
+    if (!box) return;
+    const w = box.w, hh = box.h;
+    z.x = Math.min(0, Math.max(w - w * z.k, z.x)); z.y = Math.min(0, Math.max(hh - hh * z.k, z.y));
+  };
+  const pts = new Map(); let g0 = null, moved = false, lastTap = 0;
+  const gesture = () => {
+    const a = [...pts.values()];
+    if (a.length === 1) return { cx: a[0].x, cy: a[0].y, d: 0 };
+    return { cx: (a[0].x + a[1].x) / 2, cy: (a[0].y + a[1].y) / 2, d: Math.hypot(a[0].x - a[1].x, a[0].y - a[1].y) };
+  };
+  wrap.addEventListener('pointerdown', (e) => {
+    const cell = e.target.closest('.cmpcell'); if (!cell || e.target.closest('button')) return;
+    wrap.setPointerCapture(e.pointerId);
+    // toạ độ theo khung ô (KHÔNG theo ảnh đã phóng / kéo: ảnh đã dời thì lần kéo sau bị nhảy)
+    const r = cell.querySelector('.cmpview').getBoundingClientRect();
+    const c = cell.querySelector('canvas');
+    box = { w: c.offsetWidth, h: c.offsetHeight };
+    pts.set(e.pointerId, { x: e.clientX - r.left, y: e.clientY - r.top, r });
+    g0 = { ...gesture(), z: { ...z } }; moved = false;
+  });
+  wrap.addEventListener('pointermove', (e) => {
+    const q = pts.get(e.pointerId); if (!q) return;
+    q.x = e.clientX - q.r.left; q.y = e.clientY - q.r.top;
+    const g = gesture();
+    if (Math.hypot(g.cx - g0.cx, g.cy - g0.cy) > 6 || (g.d && Math.abs(g.d - g0.d) > 6)) moved = true;
+    if (!moved) return;
+    const k = g.d && g0.d ? g0.z.k * g.d / g0.d : g0.z.k;
+    // giữ điểm dưới ngón tay đứng yên khi phóng
+    const ux = (g0.cx - g0.z.x) / g0.z.k, uy = (g0.cy - g0.z.y) / g0.z.k;
+    z.k = k; z.x = g.cx - ux * z.k; z.y = g.cy - uy * z.k;
+    clampZ(); apply();
+  });
+  const up = (e) => {
+    const q = pts.get(e.pointerId); if (!q) return;
+    pts.delete(e.pointerId);
+    if (!moved && !pts.size) {
+      const t = Date.now();
+      if (t - lastTap < 320) {                // chạm đúp: phóng x3 tại chỗ chạm / về vừa ô
+        if (z.k > 1.01) { z.k = 1; z.x = 0; z.y = 0; } else { const ux = (q.x - z.x) / z.k, uy = (q.y - z.y) / z.k; z.k = 3; z.x = q.x - ux * 3; z.y = q.y - uy * 3; }
+        clampZ(); apply(); lastTap = 0;
+      } else lastTap = t;
+    }
+    if (pts.size) g0 = { ...gesture(), z: { ...z } };
+  };
+  wrap.addEventListener('pointerup', up); wrap.addEventListener('pointercancel', up);
+  for (const it of items) {
+    const c = h('canvas', { style: 'transform-origin:0 0' });
+    const open = h('button', { class: 'cmpopen', onclick: () => { app.closeSheet(); app.openPhoto(it.p); } }, 'Mở');
+    wrap.append(h('div', { class: 'cmpcell' }, h('div', { class: 'cmpview' }, c), h('div', { class: 'nm' }, h('span', {}, it.label), open)));
   }
-  for (let i = 0; i < ps.length; i++) {
-    const p = ps[i];
+  app.openSheet(items.length === 2 && items[0].p === items[1].p ? 'So sánh trước / sau' : 'So sánh', h('div', {}, wrap,
+    hint('Chụm 2 ngón để phóng, kéo để di chuyển — mọi ảnh phóng và di chuyển cùng nhau. Chạm đúp: phóng ×3 / về vừa ô. Bấm "Mở" để chỉnh ảnh đó.')), true);
+  // ảnh giống nhau (trước / sau) chỉ giải mã một lần
+  const groups = new Map();
+  items.forEach((it, i) => { if (!groups.has(it.p.id)) groups.set(it.p.id, []); groups.get(it.p.id).push(i); });
+  for (const idx of groups.values()) {
     try {
-      const img = await app.renderPhotoPreview(p, 900);
-      const c = wrap.children[i].firstChild;
-      c.width = img.w; c.height = img.h;
-      c.getContext('2d').putImageData(new ImageData(img.rgba, img.w, img.h), 0, 0);
-    } catch (e) { wrap.children[i].append(h('div', { class: 'hint' }, 'Lỗi: ' + e.message)); }
+      const imgs = await app.renderPhotoVariants(items[idx[0]].p, 1600, idx.map((i) => items[i].settings || null));
+      idx.forEach((i, k) => {
+        const c = wrap.children[i].querySelector('canvas'), img = imgs[k];
+        c.width = img.w; c.height = img.h;
+        c.getContext('2d').putImageData(new ImageData(img.rgba, img.w, img.h), 0, 0);
+      });
+    } catch (e) { for (const i of idx) wrap.children[i].append(h('div', { class: 'hint' }, 'Lỗi: ' + e.message)); }
   }
 }
 
@@ -288,7 +369,7 @@ async function batchExport(app, ps) {
       try {
         const prep = await app.preparePhoto(p);
         const r = await runExport(app, opts, (q) => { prog.firstChild.style.width = ((i + q) / ps.length * 100).toFixed(0) + '%'; },
-          { id: prep.id, name: p.name, settings: S.mergeSettings(p.settings), bitmap: prep.src, W: prep.src.width, H: prep.src.height });
+          { id: prep.id, name: p.name, settings: S.mergeSettings(p.settings), bitmap: prep.src, W: prep.src.width, H: prep.src.height, photo: p.fileId || p.id });
         prep.release();
         results.push(r);
         stEl.textContent = `✓ ${(r.blob.size / 1048576).toFixed(1)} MB`;

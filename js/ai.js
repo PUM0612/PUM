@@ -11,14 +11,17 @@ async function lib() {
   return vision;
 }
 
-function canvasOf(rgba, w, h, maxSide) {
+function canvasOf(rgba, w, h, maxSide, align = 1) {
   const k = Math.min(1, maxSide / Math.max(w, h));
   const c = document.createElement('canvas');
   c.width = w; c.height = h;
   c.getContext('2d').putImageData(new ImageData(rgba, w, h), 0, 0);
-  if (k >= 1) return c;
+  // align: cỡ ảnh đưa vào AI là bội số của `align` (mặt nạ tách người với bề ngang lẻ làm MediaPipe web dừng hẳn:
+  // "Check failed: 1 == ChannelSize()" — gặp với ảnh dọc 1067x1600 -> 683x1024)
+  const tw = Math.max(align, Math.round(w * k / align) * align), th = Math.max(align, Math.round(h * k / align) * align);
+  if (k >= 1 && tw === w && th === h) return c;
   const d = document.createElement('canvas');
-  d.width = Math.max(1, Math.round(w * k)); d.height = Math.max(1, Math.round(h * k));
+  d.width = tw; d.height = th;
   const x = d.getContext('2d'); x.imageSmoothingQuality = 'high'; x.drawImage(c, 0, 0, d.width, d.height);
   c.width = 0;
   return d;
@@ -30,7 +33,7 @@ export async function personMask(rgba, w, h) {
   if (!pose) pose = await v.PoseLandmarker.createFromOptions(fileset, {
     baseOptions: { modelAssetPath: MODELS + 'pose_landmarker_full.task', delegate: 'CPU' },
     runningMode: 'IMAGE', numPoses: 6, outputSegmentationMasks: true });
-  const c = canvasOf(rgba, w, h, 1024);
+  const c = canvasOf(rgba, w, h, 1024, 4);
   const res = pose.detect(c);
   const mw = c.width, mh = c.height, m = new Float32Array(mw * mh);
   for (const sm of res.segmentationMasks || []) {
@@ -68,14 +71,59 @@ export async function faceLandmarks(rgba, w, h) {
     baseOptions: { modelAssetPath: MODELS + 'face_landmarker.task', delegate: 'CPU' },
     runningMode: 'IMAGE', numFaces: 12, minFaceDetectionConfidence: 0.45, minFacePresenceConfidence: 0.45 });
   const c = canvasOf(rgba, w, h, 1800);
-  const res = face.detect(c);
+  const W = c.width, H = c.height;
+  const found = detectTile(c, 0, 0, W, H, W, H, false);
+  // Bộ dò mặt của mediapipe thu cả ảnh về 128 px: mặt nhỏ (ảnh đứng toàn thân, ảnh nhóm) bị bỏ sót.
+  // Dò thêm trên các ô chồng nhau (mỗi ô ~1/2 rồi ~1/3 cạnh ngắn) để mặt trong ô đủ lớn (library.FaceMesh.landmarks).
+  for (const frac of [0.5, 0.3]) {
+    const s = Math.trunc(Math.min(H, W) * frac);
+    if (s < 160) continue;
+    const step = Math.max(1, Math.trunc(s / 2));
+    const xs = [], ys = [];
+    for (let x = 0; x <= Math.max(1, W - s); x += step) xs.push(x);
+    for (let y = 0; y <= Math.max(1, H - s); y += step) ys.push(y);
+    if (xs[xs.length - 1] + s < W) xs.push(W - s);
+    if (ys[ys.length - 1] + s < H) ys.push(H - s);
+    if (frac < 0.5 && xs.length * ys.length > 40) continue;
+    for (const y0 of ys) for (const x0 of xs)
+      for (const m of detectTile(c, x0, y0, s, s, W, H, true))
+        if (!found.some((o) => sameFace(m, o))) found.push(m);
+    if (found.length && frac === 0.5) break;          // ô 1/2 đã thấy mặt: khỏi dò ô nhỏ hơn (nhanh)
+  }
   c.width = 0;
-  const out = (res.faceLandmarks || []).map((pts) => {
-    const a = new Float32Array(pts.length * 2);
-    pts.forEach((q, i) => { a[i * 2] = q.x; a[i * 2 + 1] = q.y; });
-    return a;
-  });
   const mx = (a) => { let s = 0; for (let i = 0; i < a.length; i += 2) s += a[i]; return s / (a.length / 2); };
-  out.sort((p, q) => mx(p) - mx(q));
+  found.sort((p, q) => mx(p) - mx(q));
+  return found;
+}
+
+// dò mặt trong ô (x0, y0, w, h) của canvas c; trả toạ độ chuẩn hoá theo CẢ ảnh (library.FaceMesh._detect)
+function detectTile(c, x0, y0, w, h, W, H, edge) {
+  let src = c;
+  if (x0 || y0 || w !== W || h !== H) {
+    src = document.createElement('canvas');
+    src.width = w; src.height = h;
+    src.getContext('2d').drawImage(c, x0, y0, w, h, 0, 0, w, h);
+  }
+  let res;
+  try { res = face.detect(src); } catch (e) { return []; } finally { if (src !== c) src.width = 0; }
+  const out = [];
+  for (const pts of res.faceLandmarks || []) {
+    let mx0 = 1, my0 = 1, mx1 = 0, my1 = 0;
+    for (const q of pts) { mx0 = Math.min(mx0, q.x); mx1 = Math.max(mx1, q.x); my0 = Math.min(my0, q.y); my1 = Math.max(my1, q.y); }
+    // mặt bị mép ô cắt ngang (không phải mép ảnh): bỏ, ô kề bên sẽ thấy trọn
+    if (edge && ((mx0 < 0.01 && x0 > 0) || (my0 < 0.01 && y0 > 0) || (mx1 > 0.99 && x0 + w < W) || (my1 > 0.99 && y0 + h < H))) continue;
+    const a = new Float32Array(pts.length * 2);
+    pts.forEach((q, i) => { a[i * 2] = (q.x * w + x0) / W; a[i * 2 + 1] = (q.y * h + y0) / H; });
+    out.push(a);
+  }
   return out;
+}
+
+function sameFace(m, o) {
+  const st = (a) => { let sx = 0, sy = 0, lo = 1e9, hi = -1e9; const n = a.length / 2;
+    for (let i = 0; i < a.length; i += 2) { sx += a[i]; sy += a[i + 1]; lo = Math.min(lo, a[i]); hi = Math.max(hi, a[i]); }
+    return [sx / n, sy / n, hi - lo]; };
+  const [ax, ay, aw] = st(m), [bx, by, bw] = st(o);
+  const r = Math.max(aw, bw, 1e-4);
+  return Math.max(Math.abs(ax - bx), Math.abs(ay - by)) < 0.5 * r;
 }
