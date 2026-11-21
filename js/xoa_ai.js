@@ -132,7 +132,7 @@ export class XoaAI {
     if (this.state !== 'ready') return Promise.reject(new Error('Chưa tải mô hình AI'));
     if (!this.loaded) {
       this.loaded = this.call('load', { cache: AI_CACHE, urls: PARTS.map((p) => p[0]), total: PARTS.reduce((s, p) => s + p[1], 0) })
-        .then((r) => { this.info = { loadMs: r.ms, threads: r.threads, coi: r.coi }; return r; })
+        .then((r) => { this.info = { loadMs: r.ms, threads: r.threads, cores: r.cores, coi: r.coi }; return r; })
         .catch((e) => { this.loaded = null; throw e; });
     }
     return this.loaded;

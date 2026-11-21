@@ -11,8 +11,11 @@ import * as ort from '../../vendor/onnxruntime-web-1.31.1/ort.wasm.min.mjs';
 const VENDOR = new URL('../../vendor/onnxruntime-web-1.31.1/', import.meta.url).href;
 ort.env.wasm.wasmPaths = VENDOR;
 ort.env.wasm.proxy = false;
-// nhiều luồng chỉ khi trang được "cô lập" (service worker gắn COOP / COEP); không thì 1 luồng
-const THREADS = self.crossOriginIsolated ? Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 2) - 1)) : 1;
+// nhiều luồng chỉ khi trang được "cô lập" (service worker gắn COOP / COEP); không thì 1 luồng.
+// Dùng đủ số nhân (luồng chính chỉ chờ trong lúc AI chạy), ít nhất 2, nhiều nhất 4. iPhone X: 6 nhân (2 mạnh + 4 tiết
+// kiệm điện).
+const CORES = navigator.hardwareConcurrency || 0;
+const THREADS = self.crossOriginIsolated ? Math.max(2, Math.min(4, CORES || 4)) : 1;
 ort.env.wasm.numThreads = THREADS;
 ort.env.logLevel = 'error';
 
@@ -46,7 +49,7 @@ self.onmessage = async (ev) => {
         buf = null;
         loadMs = performance.now() - t0;
       }
-      self.postMessage({ type: 'load', req: m.req, ms: loadMs, threads: THREADS, coi: !!self.crossOriginIsolated });
+      self.postMessage({ type: 'load', req: m.req, ms: loadMs, threads: THREADS, cores: CORES, coi: !!self.crossOriginIsolated });
     } else if (m.type === 'run') {
       if (!sess) throw new Error('Mô hình chưa nạp');
       const t0 = performance.now();

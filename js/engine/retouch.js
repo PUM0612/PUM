@@ -352,6 +352,12 @@ export function applyRetouch(img, rt, ctx) {
         const ref = (ctx && ctx.xvRef) || xvRefDims(W, H);
         const key = ctx && ctx.xvPhoto ? XV.cacheKey(ctx.xvPhoto, rt, i, ref[0], ref[1]) : null;
         const draft = !!(ctx && ctx.draft);
+        if (ctx && ctx.xvKeep && key && !XV.cacheHas(key)) {
+          // khung xem chính khi AI chưa xong: GIỮ NGUYÊN vật (thanh tiến độ báo AI đang chạy), không hiện bản lấp tạm
+          // mờ nhoè — trên iPhone đời cũ AI chạy vài chục giây, bản lấp tạm hiện lâu trông như kết quả xấu
+          if (!draft) ctx.xvPending = true;
+          continue;
+        }
         if (!XV.removeSync(img, a, W, H, ox, oy, geo, { key, draft })) {
           XV.removeSync(img, a, W, H, ox, oy, geo, { key, draft: true });     // chưa có kết quả AI: lấp tạm
           if (ctx) ctx.xvPending = true;

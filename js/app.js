@@ -381,6 +381,11 @@ class App {
         if (this.panels.cur === 'scopes' && (r.hist || !this._scT || performance.now() - this._scT > 120)) { this._scT = performance.now(); this.panels.scopes.draw(this.viewer.img); }
         if (!w.draft) this.scheduleHiRes();
         if (!w.draft && r.xvPending) this.xvKick();        // có vùng xoá vật thể chưa có kết quả AI: chạy AI
+        else if (!w.draft && this._xvFinish && !this._xvRun) {
+          const f = this._xvFinish, sec = Math.round((performance.now() - f.t0) / 1000);
+          this.xvBar(false);
+          if (f.n) this.toast(`Đã xoá vật thể — AI dựng lại nền trong ${sec} giây`, 2500);
+        }
         if (!w.draft && this.panels.cur === 's_auto') setTimeout(() => this.styleThumbs(), 50);
         if (w.fresh) this.viewer.fitView(), this.viewer.apply();
       }
@@ -511,7 +516,11 @@ class App {
         await store.set('xv_keys', keys);
       } catch (e) { /* hết chỗ: chỉ giữ trong bộ nhớ */ }
     } else if (m.type === 'xv_progress') {
-      this.toast(this.ai.loaded ? 'AI đang xoá vật thể, dựng lại nền phía sau…' : 'Đang nạp AI xoá vật thể (lần đầu hơi lâu)…', 60000);
+      // bắt đầu ô thứ m.step / m.steps: đo thời gian ô trước (AI + ghép) để ước lượng phần còn lại
+      const now = performance.now();
+      if (this._xvStep) this._xvStepMs = now - this._xvStepT;
+      this._xvStep = m.step; this._xvSteps = m.steps; this._xvStepT = now;
+      this.xvBarTick();
     } else if (m.type === 'xv_run') {
       try {
         const L = await this.ai.run(m.inp, m.m);
@@ -531,7 +540,7 @@ class App {
     if (!(await this.xvIsolated())) { this._xvRun = false; return; }
     const id = this.cur.id, bitmap = this.bitmap, job = 'x' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
     const t0 = performance.now();
-    this.busy(true);
+    this.xvBar(true);
     let r = null;
     try {
       r = await new Promise((resolve) => {
@@ -543,15 +552,49 @@ class App {
         });
         this.worker.postMessage({ type: 'xv_prepare', job, id, settings: deep(this.s), W: this.fullW, H: this.fullH, photo: photoKey(this.cur) });
       });
-    } finally { this.busy(false); this._xvRun = false; }
+    } finally { this._xvRun = false; }
     this.xvMs = performance.now() - t0;
     if (r && r.error) {
       this._xvFail = sJ;
       console.error(r.error);
+      this.xvBar(false);
       this.toast('Không xoá được bằng AI: ' + r.error.split('\n')[0], 6000);
-    } else if (r && r.n) this.toast('Đã xoá vật thể (AI dựng lại nền)', 1800);
+    } else {
+      // AI xong: còn bước ghép nền vào ảnh (dựng lại) -> thanh tiến độ tắt khi ảnh mới hiện ra (pump)
+      this._xvFinish = { n: r ? r.n : 0, t0 };
+      this.xvBarTick('Đang ghép nền mới vào ảnh…');
+    }
     if (this.cur && this.cur.id === id) { this._hiKey = null; this.requestRender(false); }
+    else this.xvBar(false);
     if (this._xvAgain) { this._xvAgain = false; }
+  }
+  // thanh tiến độ Xoá vật thể trên khung ảnh (không chặn thao tác)
+  xvBar(on) {
+    let el = document.getElementById('xvbar');
+    if (!el) { el = h('div', { id: 'xvbar' }); $('viewer').append(el); }
+    clearInterval(this._xvTimer);
+    if (!on) { el.style.display = 'none'; this._xvFinish = null; return; }
+    this._xvT0 = performance.now(); this._xvStep = 0; this._xvSteps = 0; this._xvStepT = this._xvT0; this._xvStepMs = null; this._xvMsg = null;
+    el.style.display = 'flex';
+    this.xvBarTick();
+    this._xvTimer = setInterval(() => this.xvBarTick(), 1000);
+  }
+  xvBarTick(msg) {
+    const el = document.getElementById('xvbar');
+    if (!el || el.style.display === 'none') return;
+    if (msg) this._xvMsg = msg;
+    const now = performance.now(), s = Math.round((now - this._xvT0) / 1000);
+    let txt = this._xvMsg, eta = '';
+    if (!txt) {
+      if (!this._xvStep) txt = this.ai.info && this.ai.info.loadMs ? 'AI đang chuẩn bị…' : 'Đang nạp AI xoá vật thể…';
+      else txt = 'AI đang xoá vật thể' + (this._xvSteps > 1 ? ` · ô ${this._xvStep}/${this._xvSteps}` : '');
+      const per = this._xvStepMs || (this.ai.info && this.ai.info.lastMs);
+      if (per && this._xvStep) {
+        const left = Math.max(0, (this._xvSteps - this._xvStep + 1) * per - (now - this._xvStepT));
+        eta = ` · còn ~${Math.max(1, Math.ceil(left / 1000))} giây`;
+      }
+    }
+    el.replaceChildren(h('div', { class: 'spin' }), h('span', {}, `${txt} · ${s} giây${eta}`));
   }
   // mời tải mô hình AI (lần đầu dùng Xoá vật thể)
   offerAI(after) {
@@ -585,7 +628,7 @@ class App {
   aiMenu() {
     const ready = this.xvReady(), info = this.ai.info || {};
     this.openSheet('Mô hình AI xoá vật thể', h('div', { class: 'menu' },
-      h('div', { style: 'margin-bottom:8px' }, ready ? `Đã có trên máy (${Math.round(MODEL_BYTES / 1e6)} MB).` + (info.loadMs ? ` Nạp ${(info.loadMs / 1000).toFixed(1)} giây, ${info.threads} luồng.` : '') + (info.lastMs ? ` Lần chạy gần nhất ${(info.lastMs / 1000).toFixed(1)} giây / ô.` : '') : 'Chưa tải.'),
+      h('div', { style: 'margin-bottom:8px' }, ready ? `Đã có trên máy (${Math.round(MODEL_BYTES / 1e6)} MB).` + (info.loadMs ? ` Nạp ${(info.loadMs / 1000).toFixed(1)} giây, ${info.threads} luồng (máy báo ${info.cores || '?'} nhân, ${info.coi ? 'đã' : 'CHƯA'} cô lập).` : '') + (info.lastMs ? ` Lần chạy gần nhất ${(info.lastMs / 1000).toFixed(1)} giây / ô.` : '') : 'Chưa tải.'),
       ready ? btn('🗑 Xoá mô hình khỏi máy (lấy lại chỗ trống)', async () => {
         if (!confirm('Xoá mô hình AI khỏi PUM? Các vùng xoá vật thể sẽ được lấp tạm từ nền xung quanh cho tới khi tải lại.')) return;
         await this.ai.removeModel(); await this.xvSync(); this.closeSheet(); this.requestRender(false);
@@ -865,8 +908,7 @@ class App {
       a.off = this.cloneOff.slice(); a.cands = [a.off.slice()];
     } else if (a.kind === 'remove' && this.xvReady()) {
       // AI xoá hẳn vật rồi dựng lại nền (như PUM máy tính): không có vùng nguồn; v = cách lấp (Thử cách khác)
-      a.v = 0;
-      this.toast(this.ai.loaded ? 'Đang xoá vật thể (AI dựng lại nền phía sau)…' : 'Đang nạp AI xoá vật thể (lần đầu hơi lâu)…', 4000);
+      a.v = 0;          // tiến độ hiện ở thanh trên khung ảnh (xvBar)
     } else {
       this.busy(true);
       try {

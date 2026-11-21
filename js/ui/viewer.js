@@ -11,6 +11,19 @@ export class Viewer {
     this.cv = document.getElementById('cv');
     this.ov = document.getElementById('ov');
     this.ctx = this.cv.getContext('2d');
+    // ảnh "trước khi chỉnh" ở một lớp riêng, vẽ MỘT lần. Kéo vạch chia chỉ đổi đường cắt (clip-path), không vẽ lại
+    // ảnh. Trước đây mỗi lần nhích ngón tay vẽ lại cả ảnh 1600 px 2 lần nên trễ trên máy yếu (iPhone X).
+    this.bcv = document.createElement('canvas');
+    this.bcv.style.display = 'none'; this.bcv.style.pointerEvents = 'none';
+    this.stage.insertBefore(this.bcv, this.ov);
+    this.line = document.createElement('div');
+    this.line.style.cssText = 'position:absolute;top:0;display:none;pointer-events:none;background:#fff';
+    this.knob = document.createElement('div');
+    this.knob.style.cssText = 'position:absolute;display:none;pointer-events:none;border-radius:50%;background:rgba(255,255,255,.92);color:#1b1b1d;font-weight:bold;font-family:-apple-system,sans-serif;text-align:center';
+    this.knob.textContent = '◀▶';
+    this.stage.insertBefore(this.line, this.ov.nextSibling);
+    this.stage.insertBefore(this.knob, this.line.nextSibling);
+    this._raf = 0;
     this.z = 1; this.tx = 0; this.ty = 0; this.fit = true;
     this.img = null;          // ImageData đang hiển thị (sau chỉnh)
     this.before = null;       // ImageData ảnh gốc (cùng khung)
@@ -35,26 +48,47 @@ export class Viewer {
   }
   paint() {
     if (!this.img) return;
-    const showBefore = this.holding && this.before && this.before.width === this.img.width && this.before.height === this.img.height;
     if (this.holding || this.split) this.app.hideHi(); else this.app.scheduleHiRes();
-    this.ctx.putImageData(showBefore ? this.before : this.img, 0, 0);
-    if (this.split && this.before && !this.holding && this.before.width === this.img.width && this.before.height === this.img.height) {
-      // vạch chia kéo được: trái = trước khi chỉnh, phải = sau khi chỉnh
-      const w = Math.round(this.img.width * (this.splitX ?? 0.5));
-      if (w > 0) this.ctx.putImageData(this.before, 0, 0, 0, 0, w, this.img.height);
-      const lw = Math.max(2, 2 / this.z);
-      this.ctx.fillStyle = '#fff'; this.ctx.fillRect(w - lw / 2, 0, lw, this.img.height);
-      const r = 18 / this.z, cy = this.img.height / 2;
-      this.ctx.beginPath(); this.ctx.arc(w, cy, r, 0, 7); this.ctx.fillStyle = 'rgba(255,255,255,.92)'; this.ctx.fill();
-      this.ctx.fillStyle = '#1b1b1d'; this.ctx.font = `bold ${16 / this.z}px -apple-system, sans-serif`;
-      this.ctx.textAlign = 'center'; this.ctx.textBaseline = 'middle'; this.ctx.fillText('◀▶', w, cy + 1 / this.z);
-      this.ctx.textAlign = 'start'; this.ctx.textBaseline = 'alphabetic';
+    // ảnh sau chỉnh: chỉ vẽ lại khi ảnh đổi hoặc bật / tắt cảnh báo cháy sáng
+    const clipOn = this.clip && !this.holding;
+    if (this._drawn !== this.img || this._drawnClip !== clipOn) {
+      this.ctx.putImageData(this.img, 0, 0);
+      if (clipOn) this.paintClip();
+      this._drawn = this.img; this._drawnClip = clipOn;
     }
-    if (this.clip && !this.holding) this.paintClip();
+    this.paintBefore();
     const b = document.getElementById('badge');
     b.style.display = this.holding || this.split ? 'block' : 'none';
     b.textContent = this.holding ? 'Ảnh gốc (trước khi chỉnh)' : (this.split ? 'Trái: trước · Phải: sau — kéo vạch trắng để so' : '');
     this.app.drawOverlay();
+  }
+  // lớp ảnh trước khi chỉnh + vạch chia (rẻ: chỉ đổi CSS)
+  paintBefore() {
+    const sameB = this.img && this.before && this.before.width === this.img.width && this.before.height === this.img.height;
+    const showAll = this.holding && sameB, showSplit = this.split && !this.holding && sameB;
+    if ((showAll || showSplit) && this._bDrawn !== this.before) {
+      if (this.bcv.width !== this.before.width || this.bcv.height !== this.before.height) { this.bcv.width = this.before.width; this.bcv.height = this.before.height; }
+      this.bcv.getContext('2d').putImageData(this.before, 0, 0);
+      this._bDrawn = this.before;
+    }
+    this.bcv.style.display = showAll || showSplit ? 'block' : 'none';
+    const sx = this.splitX ?? 0.5;
+    const cp = showSplit ? `inset(0 ${((1 - sx) * 100).toFixed(3)}% 0 0)` : 'none';
+    this.bcv.style.clipPath = cp; this.bcv.style.webkitClipPath = cp;
+    this.line.style.display = this.knob.style.display = showSplit ? 'block' : 'none';
+    if (showSplit) {
+      // vạch chia kéo được: trái = trước khi chỉnh, phải = sau khi chỉnh (cỡ vạch / nút giữ nguyên trên màn hình)
+      const w = this.img.width * sx, lw = Math.max(2, 2 / this.z), r = 18 / this.z;
+      Object.assign(this.line.style, { left: (w - lw / 2) + 'px', width: lw + 'px', height: this.img.height + 'px' });
+      Object.assign(this.knob.style, { left: (w - r) + 'px', top: (this.img.height / 2 - r) + 'px', width: 2 * r + 'px', height: 2 * r + 'px',
+        lineHeight: 2 * r + 'px', fontSize: (13 / this.z) + 'px' });
+    }
+  }
+  // kéo vạch chia: gom các lần nhích trong một khung hình
+  moveSplit(x) {
+    this.splitX = x;
+    if (this._raf) return;
+    this._raf = requestAnimationFrame(() => { this._raf = 0; this.paintBefore(); });
   }
   paintClip() {
     const d = this.img.data, w = this.img.width, h = this.img.height;
@@ -75,6 +109,7 @@ export class Viewer {
   apply() {
     this.stage.style.transform = `translate(${this.tx}px,${this.ty}px) scale(${this.z})`;
     this.stage.style.width = this.cv.width + 'px'; this.stage.style.height = this.cv.height + 'px';
+    if (this.split) this.paintBefore();         // cỡ vạch chia theo mức phóng
   }
   // toạ độ màn hình -> điểm ảnh trên ảnh đang hiển thị
   toImg(cx, cy) {
@@ -103,8 +138,7 @@ export class Viewer {
         const sx = this.img.width * (this.splitX ?? 0.5);
         if (this.fit || Math.abs(ix - sx) * this.z < 36) {
           this.dragSplit = true;
-          this.splitX = Math.min(1, Math.max(0, ix / this.img.width));
-          this.paint();
+          this.moveSplit(Math.min(1, Math.max(0, ix / this.img.width)));
           return;
         }
       }
@@ -132,8 +166,7 @@ export class Viewer {
       if (!start) return;
       if (this.dragSplit) {
         const [ix] = this.toImg(e.clientX, e.clientY);
-        this.splitX = Math.min(1, Math.max(0, ix / this.img.width));
-        this.paint();
+        this.moveSplit(Math.min(1, Math.max(0, ix / this.img.width)));
         return;
       }
       const dx = e.clientX - start[0], dy = e.clientY - start[1];

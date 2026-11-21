@@ -44,6 +44,8 @@ async function xvPrepare(job, port, P) {
   if (!XV.state.ai || !rt || !(rt.areas || []).some((a) => a.kind === 'remove' && a.pts && a.pts.length && a.enabled !== false)) return 0;
   const W = P.W, H = P.H, [Wr, Hr] = xvRefDims(W, H), kx = W / Wr, ky = H / Hr;
   let n = 0;
+  // các vùng còn phải chạy AI (để báo tiến độ: ô thứ mấy / tổng số ô)
+  const todo = [];
   for (let i = 0; i < rt.areas.length; i++) {
     const a = rt.areas[i];
     if (!(a.kind === 'remove' && a.pts && a.pts.length && a.enabled !== false)) continue;
@@ -51,6 +53,12 @@ async function xvPrepare(job, port, P) {
     if (!key || XV.cacheHas(key)) continue;
     const got = await askXv(job, port, { type: 'xv_get', key });
     if (got.entry) { XV.cachePut(key, got.entry); XV.state.epoch++; continue; }
+    todo.push([i, key]);
+  }
+  const steps = todo.reduce((s, [i]) => s + XV.plan(rt.areas[i], Wr, Hr).length, 0);
+  let step = 0;
+  for (const [i, key] of todo) {
+    const a = rt.areas[i];
     // ảnh trước vùng này ở độ phân giải tham chiếu, phủ đủ khung các ô AI (+ vùng nguồn của retouch trước đó)
     const pre = Object.assign({}, rt, { areas: rt.areas.slice(0, i), skin_amount: 0 });
     const rn = XV.rectNorm(a, Wr, Hr);
@@ -63,8 +71,8 @@ async function xvPrepare(job, port, P) {
     for (let q = 0, j = 0; q < cw * ch; q++, j += 4) { img.d[q * 3] = u[j] / 255; img.d[q * 3 + 1] = u[j + 1] / 255; img.d[q * 3 + 2] = u[j + 2] / 255; }
     const roi = [x0, y0, Wr, Hr];
     if (hasRetouch(pre)) img = applyRetouch(img, pre, { roi, xvPhoto: P.photo, xvRef: [Wr, Hr] });
-    const tiles = await XV.removeAsync(img, a, Wr, Hr, x0, y0, areaGeom(a, Wr, Hr, x0, y0), { key }, async (inp, m) => {
-      port.postMessage({ type: 'xv_progress', job, area: i });
+    const tiles = await XV.removeAsync(img, a, Wr, Hr, x0, y0, areaGeom(a, Wr, Hr, x0, y0), { key, tilesOnly: true }, async (inp, m) => {
+      port.postMessage({ type: 'xv_progress', job, area: i, step: ++step, steps });
       const r = await askXv(job, port, { type: 'xv_run', inp, m }, [inp.buffer, m.buffer]);
       if (r.error) throw new Error(r.error);
       return r.L;

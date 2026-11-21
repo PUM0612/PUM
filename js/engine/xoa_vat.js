@@ -1001,6 +1001,9 @@ export function* removeGen(out, a, W, H, ox, oy, geo, opt = {}) {
       }
     }
     if (!ent && key) cachePut(key, { tiles: newTiles });
+    // chỉ cần kết quả AI (export.js xvPrepare): bỏ hoà mép / ghép chi tiết của ảnh tham chiếu — ảnh đó bỏ đi, các ô AI
+    // không phụ thuộc bước này (ô sau lấy nền ô trước TRƯỚC khi hoà mép), nên kết quả không đổi mà đỡ vài giây
+    if (opt.tilesOnly) return newTiles;
     let tq = performance.now();
     if (DBG.seam) F = seamFix(C0, F, hole, tinfo, ix0, iy0, W, H, Math.max(kxy[0], kxy[1]), Math.min(kxy[0], kxy[1]));
     DBG.ms.seam = (DBG.ms.seam || 0) + performance.now() - tq; tq = performance.now();

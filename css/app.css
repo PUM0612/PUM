@@ -35,6 +35,11 @@ select { -webkit-appearance: none; appearance: none; padding-right: 22px;
   padding: 8px 12px; border-radius: 10px; font-size: 13px; opacity: 0; transition: opacity .25s; pointer-events: none; text-align: center; }
 #toast.show { opacity: 1; }
 #busy { position: absolute; right: 10px; top: 10px; display: none; }
+/* thanh tiến độ Xoá vật thể bằng AI (không chặn thao tác) */
+#xvbar { position: absolute; left: 50%; top: 10px; transform: translateX(-50%); display: none; align-items: center; gap: 8px; max-width: 92%;
+  background: rgba(20,20,22,.9); border: 1px solid var(--line); border-radius: 16px; padding: 6px 12px; font-size: 13px; color: var(--fg);
+  pointer-events: none; z-index: 6; white-space: nowrap; }
+#xvbar .spin { flex: none; }
 #busy.show { display: block; }
 .spin { width: 18px; height: 18px; border: 2px solid #555; border-top-color: var(--acc); border-radius: 50%; animation: sp .8s linear infinite; }
 @keyframes sp { to { transform: rotate(360deg); } }

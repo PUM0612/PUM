@@ -112,7 +112,8 @@ function renderBase(b, which, settings, geom) {
   const s = mergeSettings(settings);
   const base = which === 'draft' ? b.draft : (which === 'draft2' || which === 'thumb') ? b.draft2 : b.full;
   const scale = base.w / b.fullW;
-  const ctx = { scale, personFn: b.personFn || null, faces: b.faces || null, xvPhoto: b.photo, xvRef: xvRefDims(b.fullW, b.fullH), draft: which !== 'full' };
+  const ctx = { scale, personFn: b.personFn || null, faces: b.faces || null, xvPhoto: b.photo, xvRef: xvRefDims(b.fullW, b.fullH), draft: which !== 'full',
+    xvKeep: which !== 'thumb' };
   if (which === 'full') ctx.infosOut = [];
   const cacheKey = which;
   b.cache = b.cache || {};
