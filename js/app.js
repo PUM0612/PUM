@@ -77,11 +77,12 @@ class App {
     if (p) this.openPhoto(p);
     else this.refresh();
     if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1')) {
+      const hadController = !!navigator.serviceWorker.controller;     // lần mở đầu tiên: chưa có bản cũ -> không báo
       navigator.serviceWorker.register('sw.js').then((reg) => {
         reg.addEventListener('updatefound', () => {
           const nw = reg.installing;
           nw && nw.addEventListener('statechange', () => {
-            if (nw.state === 'installed' && navigator.serviceWorker.controller) this.toast('Đã có bản PUM mới — đóng hẳn app rồi mở lại để dùng bản mới.', 6000);
+            if (hadController && !this._updToast && (nw.state === 'installed' || nw.state === 'activated') && (this._updToast = true)) this.toast('Đã có bản PUM mới — đóng hẳn app rồi mở lại để dùng bản mới.', 6000);
           });
         });
       }).catch(() => {});
@@ -336,6 +337,7 @@ class App {
         if (r.hist && this.panels.cur === 'curve') this.panels.curve.draw();
         if (this.panels.cur === 'scopes' && (r.hist || !this._scT || performance.now() - this._scT > 120)) { this._scT = performance.now(); this.panels.scopes.draw(this.viewer.img); }
         if (!w.draft) this.scheduleHiRes();
+        if (!w.draft && this.panels.cur === 's_auto') setTimeout(() => this.styleThumbs(), 50);
         if (w.fresh) this.viewer.fitView(), this.viewer.apply();
       }
     } catch (e) { this.toast('Lỗi dựng ảnh: ' + e.message, 4000); }
@@ -726,12 +728,15 @@ class App {
       if (pts.length === 1) { const p = this.srcToDisp(pts[0].map((v, i) => v + (off ? off[i] : 0))); c.lineTo(p[0] + 0.01, p[1]); }
     };
     c.lineCap = 'round'; c.lineJoin = 'round';
-    (rt.areas || []).forEach((a, i) => {
-      const sel = i === this.selArea, rr = a.r * W * k * 2;
-      path(a.pts); c.strokeStyle = sel ? 'rgba(255,212,0,.35)' : 'rgba(255,255,255,.18)'; c.lineWidth = rr; c.stroke();
-      if (sel && a.off) { path(a.pts, a.off); c.setLineDash([6 / z, 5 / z]); c.strokeStyle = 'rgba(255,255,255,.9)'; c.lineWidth = 1.5 / z; c.stroke(); c.setLineDash([]);
-        path(a.pts, a.off); c.strokeStyle = 'rgba(255,255,255,.15)'; c.lineWidth = rr; c.stroke(); }
-    });
+    // chỉ đánh dấu nhẹ vùng đang chọn (để vẫn nhìn rõ kết quả xoá): viền nét đứt + nguồn nét đứt mờ
+    // viền mảnh quanh nét tô (vẽ nét dày rồi khoét lõi) — không che kết quả
+    const ring = (pts, off, col) => {
+      const rr = (this.s.retouch.areas[this.selArea] || {}).r * W * k * 2;
+      c.save(); path(pts, off); c.strokeStyle = col; c.lineWidth = rr + 3 / z; c.stroke();
+      c.globalCompositeOperation = 'destination-out'; path(pts, off); c.strokeStyle = '#000'; c.lineWidth = Math.max(0, rr - 0.5 / z); c.stroke(); c.restore();
+    };
+    const sa = (rt.areas || [])[this.selArea];
+    if (sa && sa.pts) { ring(sa.pts, null, 'rgba(255,212,0,.95)'); if (sa.off) ring(sa.pts, sa.off, 'rgba(255,255,255,.7)'); }
     (rt.spots || []).forEach((sp, i) => {
       const p = this.srcToDisp([sp.x, sp.y]);
       c.strokeStyle = i === this.selSpot ? '#ffd400' : 'rgba(255,255,255,.7)'; c.lineWidth = 1.5 / z;
@@ -764,8 +769,8 @@ class App {
         c.beginPath(); c.moveTo(...a); c.lineTo(...b); c.stroke();
       }
     }
-    if (this.panels.cur === 'retouch') this.drawRetouch(c, z, finger);
-    if (this.panels.cur === 'portrait' && this.faces && this.faces.length) {
+    if (this.panels.cur === 'retouch' || this.panels.cur === 's_erase') this.drawRetouch(c, z, finger);
+    if ((this.panels.cur === 'portrait' || this.panels.cur === 's_face') && this.faces && this.faces.length) {
       // khung cam đánh số từng khuôn mặt (trái -> phải) + vùng bảo vệ
       c.lineWidth = 2 / z; c.font = `bold ${16 / z}px -apple-system, sans-serif`;
       const boxes = faceBoxes(this.faces).map((b, i) => [b, i]).sort((a, b) => (a[0][0] + a[0][2]) - (b[0][0] + b[0][2]));
@@ -916,6 +921,62 @@ class App {
     finally { this.busy(false); }
   }
 
+  // ----------------------------------------------------------------- giao diện đơn giản: Tự động một chạm
+  async autoSome(keys, label = 'Tự động') {
+    if (!this.cur) return this.toast('Chưa mở ảnh nào');
+    this.busy(true);
+    const msgs = [];
+    try {
+      this.begin(label);
+      for (const key of keys) {                       // lần lượt: nhóm sau đo trên ảnh đã có nhóm trước
+        const r = await this.call('auto', { id: this.cur.id, key, settings: this.s, layer: this.layerIdx });
+        for (const [p, v] of r.res.up) this.set(p, v);
+        msgs.push(r.res.msg);
+      }
+      this.end();
+    } catch (e) { this.end(); this.toast('Auto lỗi: ' + e.message); }
+    this.busy(false);
+    return msgs;
+  }
+  async autoAll() {
+    const m = await this.autoSome(['color', 'tone', 'presence'], 'Tự động chỉnh ảnh');
+    if (m) this.toast('Đã tự cân màu, sáng tối và độ trong', 2500);
+  }
+  async autoFace() {
+    if (!this.cur) return this.toast('Chưa mở ảnh nào');
+    const f = await this.ensureFaces();
+    if (!f || !f.length) return this.toast('Không thấy khuôn mặt nào trong ảnh');
+    await this.autoSome(['portrait:Xoá khuyết điểm', 'portrait:Điều chỉnh da', 'portrait:Tăng cường mắt', 'portrait:Làm đẹp răng'], 'Làm đẹp tự động');
+    this.toast(`Đã làm đẹp ${f.length} khuôn mặt — chỉnh thêm bằng các thanh bên dưới`, 3000);
+  }
+  clearStyle() {
+    if (!this._style) return;
+    this.begin('Bỏ style');
+    this.s = S.mergeSettings(this._styleBase);
+    this._style = null; this.styleApplied = null; this.styleStrength = 100;
+    this.end();
+  }
+  // ảnh xem trước nhỏ của từng style trên chính ảnh đang mở
+  async styleThumbs() {
+    if (!this.cur || this._thumbBusy || this.inflight || this.want) return;
+    const base = this._style ? this._styleBase : this.s;
+    const key = J([this.cur.id, base, this.allStyles().map((x) => x[0])]);
+    if (key === this._thumbKey) return;
+    this._thumbBusy = true;
+    const id = this.cur.id, out = {};
+    try {
+      for (const [name, st] of [['Gốc', null], ...this.allStyles()]) {
+        const s = st ? S.blendStyle(base, st, 1) : base;
+        const r = await this.call('render', { id, which: 'thumb', settings: s, geom: true });
+        if (!this.cur || this.cur.id !== id) return;
+        out[name] = await createImageBitmap(new ImageData(r.rgba, r.w, r.h));
+        this.thumbs = Object.assign({}, this.thumbs || {}, out);
+        this.panels.drawStyleGrid();
+      }
+      this._thumbKey = key;
+    } catch (e) { console.warn(e); } finally { this._thumbBusy = false; }
+  }
+
   // ----------------------------------------------------------------- layer
   addLayer() {
     this.begin('Thêm layer');
@@ -1028,7 +1089,9 @@ class App {
       onclick: async () => { p.rating = n; await store.putPhoto(p); this.openMenu(); } }, n ? '★'.repeat(n) : '☆')),
     h('button', { class: p.flag === 1 ? 'sel' : '', onclick: async () => { p.flag = p.flag === 1 ? 0 : 1; await store.putPhoto(p); this.openMenu(); } }, '✓ Chọn'),
     h('button', { class: p.flag === -1 ? 'sel' : '', onclick: async () => { p.flag = p.flag === -1 ? 0 : -1; await store.putPhoto(p); this.openMenu(); } }, '✕ Loại')) : null;
+    const simple = this.panels.mode === 'simple';
     const body = h('div', { class: 'menu' }, rate,
+      btn(simple ? '🔧 Giao diện đầy đủ (mọi công cụ như PUM máy tính)' : '✨ Giao diện đơn giản (dễ dùng)', () => { this.closeSheet(); this.panels.setMode(simple ? 'full' : 'simple'); }),
       btn('🗂 Thư viện (lọc, đánh sao, so sánh, xuất hàng loạt)', () => this.openLibrary()),
       btn('📂 Mở ảnh từ Ảnh / Tệp', () => { this.closeSheet(); $('file').click(); }),
       clip.el,

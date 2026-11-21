@@ -106,7 +106,7 @@ function isActive(name, s) {
 
 function renderBase(b, which, settings, geom) {
   const s = mergeSettings(settings);
-  const base = which === 'draft' ? b.draft : which === 'draft2' ? b.draft2 : b.full;
+  const base = which === 'draft' ? b.draft : (which === 'draft2' || which === 'thumb') ? b.draft2 : b.full;
   const scale = base.w / b.fullW;
   const ctx = { scale, personFn: b.personFn || null, faces: b.faces || null };
   const cacheKey = which;
@@ -122,7 +122,7 @@ function maskOverlay(b, which, settings, geom, idx, img) {
   const s = mergeSettings(settings);
   const ly = s.layers[idx];
   if (!ly) return img;
-  const base = which === 'draft' ? b.draft : which === 'draft2' ? b.draft2 : b.full;
+  const base = which === 'draft' ? b.draft : (which === 'draft2' || which === 'thumb') ? b.draft2 : b.full;
   const m = E.layerMaskFor(base, Object.assign({}, ly, { enabled: true }), { personFn: b.personFn || null });
   const mi = cv.img3(base.w, base.h);
   for (let i = 0; i < m.d.length; i++) mi.d[i * 3] = mi.d[i * 3 + 1] = mi.d[i * 3 + 2] = m.d[i];

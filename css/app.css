@@ -121,7 +121,27 @@ button.sel { border-color: var(--acc); color: var(--acc); background: #2f2c27; }
 .libgrid .nm { position: absolute; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,.55); font-size: 10px; padding: 1px 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .cmp { display: grid; grid-template-columns: 1fr; gap: 6px; }
 .cmp.four { grid-template-columns: 1fr 1fr; }
-.cmpcell canvas { width: 100%; display: block; border-radius: 6px; background: #000; }
+.cmpcell { text-align: center; }
+.cmpcell canvas { max-width: 100%; max-height: 36vh; width: auto; height: auto; display: block; margin: 0 auto; border-radius: 6px; background: #000; }
+.cmp.four .cmpcell canvas { max-height: 30vh; }
+/* ---- giao diện Đơn giản */
+#app.simple { --panel-h: 40vh; }
+#app.simple .sl-top .pm { display: none; }
+#app.simple .sl-top .num { width: 52px; border: none; background: transparent; color: var(--acc2); font-weight: 600; }
+#app.simple .sl-top .lb { font-size: 14px; color: var(--fg); }
+#app.simple .sl { padding: 2px 0 6px; }
+#app.simple #tabs { grid-template-columns: repeat(7, 1fr); gap: 1px; }
+#app.simple #tabs button { font-size: 10.5px; padding: 6px 0 5px; letter-spacing: -0.2px; }
+button.tall { padding: 14px 4px; font-size: 13px; }
+#app.simple #tabs button .ic { font-size: 19px; }
+.bigauto { display: block; width: 100%; margin: 8px 0 6px; padding: 14px; font-size: 16px; font-weight: 700; border-radius: 12px;
+  background: linear-gradient(90deg, #e8a33d, #f2c26b); color: #1b1b1d; border: none; }
+.stitle { font-weight: 600; margin: 12px 0 6px; }
+.stylegrid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+.stylegrid button { padding: 3px; border-radius: 10px; display: flex; flex-direction: column; align-items: center; gap: 3px; font-size: 11px; }
+.stylegrid button canvas { width: 100%; aspect-ratio: 1; border-radius: 7px; background: #111; display: block; }
+.stylegrid button.sel { border-color: var(--acc); color: var(--acc); }
+button.more { display: block; width: 100%; margin: 14px 0 4px; background: transparent; border: 1px dashed var(--line); color: var(--fg2); }
 .cmpcell .nm { font-size: 12px; color: var(--fg2); padding: 2px 0 6px; }
 .list .it .st { color: var(--fg2); font-size: 12px; }
 .menu > button { display: block; width: 100%; text-align: left; margin: 0 0 6px; padding: 12px 14px; }

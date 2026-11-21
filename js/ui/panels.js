@@ -11,6 +11,14 @@ export const TABS = [
   ['style', '★', 'Style'], ['scopes', '▦', 'Biểu đồ'],
 ];
 
+// Giao diện Đơn giản (mặc định cho mọi người): 6 tab, mỗi tab vài thanh chính, Tự động một chạm.
+export const SIMPLE_TABS = [
+  ['s_auto', '✦', 'Tự động'], ['s_light', '☀', 'Ánh sáng'], ['s_color', '◍', 'Màu'],
+  ['s_effect', '◎', 'Hiệu ứng'], ['s_crop', '⬚', 'Cắt'], ['s_erase', '✚', 'Xoá'], ['s_face', '☺', 'Chân dung'],
+];
+const TO_FULL = { s_auto: 'style', s_light: 'basic', s_color: 'color', s_effect: 'detail', s_crop: 'lens', s_erase: 'retouch', s_face: 'portrait' };
+const TO_SIMPLE = { basic: 's_light', color: 's_color', grading: 's_color', curve: 's_light', detail: 's_effect', lens: 's_crop', retouch: 's_erase', portrait: 's_face', style: 's_auto' };
+
 export class Panels {
   constructor(app) {
     this.app = app;
@@ -19,12 +27,28 @@ export class Panels {
     this.pane = document.getElementById('pane');
     this.pages = {};
     this.band = 'red';
-    for (const [k, ic, t] of TABS) {
-      const b = h('button', { 'data-k': k, onclick: () => this.show(k) }, h('span', { class: 'ic' }, ic), t);
-      this.tabsEl.append(b);
-    }
+    let m = 'simple';
+    try { m = localStorage.getItem('pum_ui_mode') || 'simple'; } catch (e) { /* bỏ qua */ }
+    this.mode = m === 'full' ? 'full' : 'simple';
     this.build();
-    this.show('basic');
+    this.buildSimple();
+    this.renderTabs();
+    this.show(this.mode === 'simple' ? 's_auto' : 'basic');
+  }
+  renderTabs() {
+    document.getElementById('app').classList.toggle('simple', this.mode === 'simple');
+    this.tabsEl.replaceChildren();
+    for (const [k, ic, t] of (this.mode === 'simple' ? SIMPLE_TABS : TABS))
+      this.tabsEl.append(h('button', { 'data-k': k, onclick: () => this.show(k) }, h('span', { class: 'ic' }, ic), t));
+  }
+  setMode(m) {
+    if (m === this.mode) return;
+    this.mode = m;
+    try { localStorage.setItem('pum_ui_mode', m); } catch (e) { /* bỏ qua */ }
+    const target = m === 'simple' ? (TO_SIMPLE[this.cur] || 's_auto') : (TO_FULL[this.cur] || 'basic');
+    this.renderTabs();
+    this.show(target);
+    this.app.toast(m === 'simple' ? 'Giao diện đơn giản' : 'Giao diện đầy đủ (mọi công cụ như PUM máy tính)');
   }
   S(label, path, lo, hi, o = {}) {
     const app = this.app;
@@ -42,8 +66,132 @@ export class Panels {
     this.pane.scrollTop = 0;
     this.sync();
     if (this.app.tool) this.app.setTool(null);
-    if (k === 'portrait' && this.app.cur) this.app.ensureFaces().then(() => this.sync());
+    if ((k === 'portrait' || k === 's_face') && this.app.cur) this.app.ensureFaces().then(() => this.sync());
+    if (k === 's_auto') this.app.styleThumbs();
     this.app.drawOverlay();
+  }
+
+  // ------------------------------------------------------------------ giao diện Đơn giản
+  buildSimple() {
+    const app = this.app;
+    const more = (k) => h('button', { class: 'more', onclick: () => this.setMode('full') }, 'Công cụ nâng cao ›');
+    const big = (t, fn) => h('button', { class: 'bigauto', onclick: fn }, t);
+    // nhiều thông số theo một thanh (tỉ lệ cố định), đọc lại theo thông số chính
+    const multi = (label, main, parts, o = {}) => this.S(label, ['_m_' + label], o.lo ?? 0, o.hi ?? 100, Object.assign({
+      get: () => Math.round((+app.get(main[0]) || 0) / main[1]),
+      set: (v, live) => { for (const [p, k] of parts) app.set(p, Math.round(v * k * 10) / 10, live); },
+    }, o));
+    // ---- Tự động + style
+    this.styleGrid = h('div', { class: 'stylegrid' });
+    const strength = new Slider(app, { label: 'Độ mạnh style', lo: 0, hi: 150, def: 100, get: () => app.styleStrength,
+      set: (v, live) => app.setStyleStrength(v, live), dep: () => (app.styleApplied ? '' : 'Chọn một style trước') });
+    this.W(strength);
+    this.W({ sync: () => this.drawStyleGrid() });
+    this.page('s_auto',
+      big('✨ Tự động chỉnh ảnh', () => app.autoAll()),
+      h('div', { class: 'hint' }, 'Tự cân màu, sáng tối và độ trong — chỉnh thêm ở các tab bên cạnh nếu muốn.'),
+      h('div', { class: 'stitle' }, 'Style'), this.styleGrid, strength.el,
+      h('div', { class: 'grid2', style: 'margin-top:8px' }, btn('↺ Bỏ mọi chỉnh sửa', () => app.resetAll()), btn('Sao chép / dán…', () => this.setMode('full'))),
+      more());
+    // ---- Ánh sáng
+    this.page('s_light',
+      this.S('Phơi sáng', ['exposure'], -5, 5, { step: 0.01, dec: 2 }),
+      this.S('Tương phản', ['contrast'], -100, 100),
+      this.S('Vùng sáng', ['highlights'], -100, 100),
+      this.S('Vùng tối', ['shadows'], -100, 100),
+      this.S('Trắng', ['whites'], -100, 100),
+      this.S('Đen', ['blacks'], -100, 100),
+      h('div', { class: 'grid2' }, btn('Tự động ánh sáng', () => app.auto('tone')), btn('↺ Đặt lại', () => app.resetPaths([['exposure'], ['contrast'], ['highlights'], ['shadows'], ['whites'], ['blacks'], ['brightness']]))),
+      more());
+    // ---- Màu
+    this.page('s_color',
+      this.S('Nhiệt độ', ['temp'], -100, 100, { gradient: ['#3d6fd9', '#cccccc', '#e3b23c'] }),
+      this.S('Sắc thái', ['tint'], -100, 100, { gradient: ['#3dbb4a', '#cccccc', '#c94fc4'] }),
+      this.S('Độ tươi màu', ['vibrance'], -100, 100, { gradient: ['#777777', '#a98bb8', '#d7508e'] }),
+      this.S('Bão hoà', ['saturation'], -100, 100, { gradient: ['#777777', '#cf9a52', '#e2403a'] }),
+      multi('Da đều màu', [['skin', 'uni_hue'], 1], [[['skin', 'uni_hue'], 1], [['skin', 'uni_sat'], 0.7], [['skin', 'uni_lum'], 0.4]]),
+      h('div', { class: 'grid3' }, btn('Tự động màu', () => app.auto('color')), btn('💧 Chấm điểm trắng', () => app.setTool(app.tool === 'wb' ? null : 'wb')),
+        btn('↺ Đặt lại', () => app.resetPaths([['temp'], ['tint'], ['vibrance'], ['saturation'], ['skin']]))),
+      more());
+    // ---- Hiệu ứng
+    this.page('s_effect',
+      this.S('Rõ nét', ['clarity'], -100, 100),
+      this.S('Khử sương', ['dehaze'], -100, 100),
+      this.S('Làm nét', ['sharpen'], 0, 150),
+      multi('Khử nhiễu', [['nr_lum'], 1], [[['nr_lum'], 1], [['nr_color'], 0.6]]),
+      this.S('Tối góc', ['vignette'], -100, 100),
+      this.S('Hạt phim', ['grain'], 0, 100),
+      h('div', { class: 'grid2' }, btn('Tự động', () => app.autoSome(['presence', 'sharpen', 'nr'])),
+        btn('↺ Đặt lại', () => app.resetPaths([['clarity'], ['dehaze'], ['sharpen'], ['nr_lum'], ['nr_color'], ['vignette'], ['grain'], ['texture']]))),
+      more());
+    // ---- Cắt & xoay
+    const ratios = h('div', { class: 'chips' });
+    for (const [k, t] of [['orig', 'Gốc'], ['1:1', '1:1'], ['4:5', '4:5'], ['9:16', '9:16'], ['16:9', '16:9'], ['3:2', '3:2'], ['2:3', '2:3']])
+      ratios.append(h('button', { 'data-r': k, onclick: () => app.setCrop(k) }, t));
+    const cropBtn = btn('✂ Kéo khung cắt', () => app.setTool(app.tool === 'crop' ? null : 'crop'));
+    this.W({ sync: () => {
+      for (const b of ratios.children) b.classList.toggle('sel', b.dataset.r === app.get(['crop']) && (b.dataset.r !== 'orig' || !app.get(['crop_rect'])));
+      cropBtn.textContent = app.tool === 'crop' ? '✓ Xong cắt' : '✂ Kéo khung cắt'; cropBtn.classList.toggle('sel', app.tool === 'crop');
+    } });
+    this.page('s_crop',
+      h('div', { class: 'stitle' }, 'Tỉ lệ khung'), ratios,
+      h('div', { class: 'grid2', style: 'margin-top:8px' }, cropBtn, btn('Bỏ cắt', () => app.clearCrop())),
+      this.S('Góc nghiêng', ['straighten'], -45, 45, { step: 0.1, dec: 1 }),
+      h('div', { class: 'grid3' }, btn('↺ Xoay trái', () => app.rotate(-90)), btn('↻ Xoay phải', () => app.rotate(90)), btn('Tự cân thẳng', () => app.auto('straighten'))),
+      h('div', { class: 'grid2', style: 'margin-top:6px' }, btn('⇋ Lật gương', () => { app.begin('Lật'); app.set(['flip'], app.get(['flip']) === 'h' ? 'none' : 'h'); app.end(); }),
+        btn('Kẻ đường chân trời', () => app.setTool(app.tool === 'level' ? null : 'level'))),
+      more());
+    // ---- Xoá vật thể / mụn / bụi
+    const etools = h('div', { class: 'grid3' });
+    for (const [k, t] of [['remove', '🧽 Xoá vật thể'], ['heal', '🩹 Xoá mụn, vết'], ['dust', '· Xoá chấm bụi']])
+      etools.append(h('button', { 'data-t': k, class: 'tall', onclick: () => app.setTool(app.tool === k ? null : k) }, t));
+    const einfo = h('div', { class: 'hint' });
+    this.W({ sync: () => {
+      for (const b of etools.children) b.classList.toggle('sel', app.tool === b.dataset.t);
+      const rt = app.s.retouch, n = (rt.areas || []).length + (rt.spots || []).length, sel = app.rtSel();
+      einfo.textContent = (n ? `Đã xoá ${n} chỗ` : 'Chưa xoá gì') + (sel ? ` · đang chọn: ${sel.label}` : '');
+    } });
+    const ebrush = new Slider({ begin() {}, end() {}, toast: (m) => app.toast(m) }, { label: 'Cỡ cọ', lo: 0.2, hi: 15, def: 2, step: 0.1, dec: 1, get: () => app.rtSize, set: (v) => { app.rtSize = v; } });
+    this.W(ebrush);
+    this.page('s_erase',
+      h('div', { class: 'stitle' }, 'Chọn công cụ rồi tô lên ảnh'), etools, ebrush, einfo,
+      h('div', { class: 'grid3', style: 'margin-top:6px' }, btn('Đổi nguồn', () => app.rtNextSource()), btn('Bỏ chỗ đang chọn', () => app.rtDeleteSel()), btn('Bỏ hết', () => app.rtClear('areas'))),
+      hint('Tô kín vật cần xoá (dây điện, người qua đường, rác…) bằng 1 ngón tay; dùng 2 ngón để phóng / di chuyển ảnh. App lấp bằng vùng xung quanh — đẹp nhất trên nền trơn (trời, tường, sàn). Chưa ưng thì bấm "Đổi nguồn" hoặc ↶ để làm lại. Chạm vào chỗ đã xoá để chọn nó.'),
+      more());
+    // ---- Chân dung
+    const P = (k) => ['retouch', 'portrait', k];
+    const faceInfo = h('div', { class: 'hint', style: 'color:#f0b050' });
+    this.W({ sync: () => { const f = app.faces; faceInfo.textContent = !app.cur ? '' : f == null ? 'Đang tìm khuôn mặt…' : f.length ? `Nhận ra ${f.length} khuôn mặt` : 'Không thấy khuôn mặt nào trong ảnh'; } });
+    this.page('s_face', faceInfo,
+      big('✨ Làm đẹp tự động', () => app.autoFace()),
+      multi('Mịn da', [P('even'), 0.7], [[P('blemish'), 0.9], [P('even'), 0.7], [P('shine'), 0.5], [P('dark_circles'), 0.6]]),
+      multi('Mắt sáng', [P('iris_l'), 1], [[P('iris_l'), 1], [P('iris_r'), 1], [P('sclera_l'), 0.8], [P('sclera_r'), 0.8]]),
+      multi('Răng trắng', [P('teeth_bright'), 1], [[P('teeth_bright'), 1], [P('teeth_desat'), 1]]),
+      this.S('Môi hồng', P('lips'), 0, 100),
+      this.S('Thon mặt', P('face_slim'), 0, 100),
+      this.S('Mắt to', P('eyes_big'), 0, 100),
+      h('div', { class: 'grid2' }, btn('↺ Đặt lại chân dung', () => app.resetPaths([P('blemish'), P('even'), P('shine'), P('dark_circles'), P('iris_l'), P('iris_r'), P('sclera_l'), P('sclera_r'), P('teeth_bright'), P('teeth_desat'), P('lips'), P('face_slim'), P('eyes_big')]))),
+      more());
+  }
+  drawStyleGrid() {
+    const app = this.app, g = this.styleGrid;
+    if (!g) return;
+    const items = [['Gốc', null], ...app.allStyles()];
+    if (g.children.length !== items.length) {
+      g.replaceChildren(...items.map(([name, st]) => {
+        const c = h('canvas', { width: 96, height: 96 });
+        return h('button', { 'data-n': name, onclick: () => (st ? app.applyStyle(name, st) : app.clearStyle()) }, c, h('span', {}, name));
+      }));
+    }
+    for (const b of g.children) {
+      b.classList.toggle('sel', (app.styleApplied || 'Gốc') === b.dataset.n);
+      const th = app.thumbs && app.thumbs[b.dataset.n];
+      if (th && b.firstChild._src !== th) {
+        const c = b.firstChild, x = c.getContext('2d'), s = Math.min(th.width, th.height);
+        x.drawImage(th, (th.width - s) / 2, (th.height - s) / 2, s, s, 0, 0, 96, 96);
+        c._src = th;
+      }
+    }
   }
   sync() { for (const w of this.widgets) w.sync(); }
 

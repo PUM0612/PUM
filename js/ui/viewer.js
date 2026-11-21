@@ -39,14 +39,21 @@ export class Viewer {
     if (this.holding || this.split) this.app.hideHi(); else this.app.scheduleHiRes();
     this.ctx.putImageData(showBefore ? this.before : this.img, 0, 0);
     if (this.split && this.before && !this.holding && this.before.width === this.img.width && this.before.height === this.img.height) {
-      const w = this.img.width >> 1;
-      this.ctx.putImageData(this.before, 0, 0, 0, 0, w, this.img.height);
-      this.ctx.fillStyle = '#fff'; this.ctx.fillRect(w - 1, 0, 2, this.img.height);
+      // vạch chia kéo được: trái = trước khi chỉnh, phải = sau khi chỉnh
+      const w = Math.round(this.img.width * (this.splitX ?? 0.5));
+      if (w > 0) this.ctx.putImageData(this.before, 0, 0, 0, 0, w, this.img.height);
+      const lw = Math.max(2, 2 / this.z);
+      this.ctx.fillStyle = '#fff'; this.ctx.fillRect(w - lw / 2, 0, lw, this.img.height);
+      const r = 18 / this.z, cy = this.img.height / 2;
+      this.ctx.beginPath(); this.ctx.arc(w, cy, r, 0, 7); this.ctx.fillStyle = 'rgba(255,255,255,.92)'; this.ctx.fill();
+      this.ctx.fillStyle = '#1b1b1d'; this.ctx.font = `bold ${16 / this.z}px -apple-system, sans-serif`;
+      this.ctx.textAlign = 'center'; this.ctx.textBaseline = 'middle'; this.ctx.fillText('◀▶', w, cy + 1 / this.z);
+      this.ctx.textAlign = 'start'; this.ctx.textBaseline = 'alphabetic';
     }
     if (this.clip && !this.holding) this.paintClip();
     const b = document.getElementById('badge');
     b.style.display = this.holding || this.split ? 'block' : 'none';
-    b.textContent = this.holding ? 'Ảnh gốc (trước khi chỉnh)' : (this.split ? 'Trái: trước · Phải: sau' : '');
+    b.textContent = this.holding ? 'Ảnh gốc (trước khi chỉnh)' : (this.split ? 'Trái: trước · Phải: sau — kéo vạch trắng để so' : '');
     this.app.drawOverlay();
   }
   paintClip() {
@@ -82,7 +89,7 @@ export class Viewer {
       vp.setPointerCapture(e.pointerId);
       this.ptrs.set(e.pointerId, [e.clientX, e.clientY]);
       if (this.ptrs.size === 2) {
-        clearTimeout(hold); this.holding = false;
+        clearTimeout(hold); this.holding = false; this.dragSplit = false;
         if (this.toolActive) { this.app.toolCancel(); this.toolActive = false; }
         const [a, b] = [...this.ptrs.values()];
         pinch = { d: Math.hypot(a[0] - b[0], a[1] - b[1]), cx: (a[0] + b[0]) / 2, cy: (a[1] + b[1]) / 2, z: this.z, tx: this.tx, ty: this.ty };
@@ -90,6 +97,17 @@ export class Viewer {
       }
       if (this.ptrs.size > 2) return;
       start = [e.clientX, e.clientY, this.tx, this.ty]; moved = false;
+      // chế độ chia đôi: chạm gần vạch chia (hoặc bất kỳ đâu khi ảnh đang vừa màn hình) để kéo vạch
+      if (this.split && this.img && !this.app.tool) {
+        const [ix] = this.toImg(e.clientX, e.clientY);
+        const sx = this.img.width * (this.splitX ?? 0.5);
+        if (this.fit || Math.abs(ix - sx) * this.z < 36) {
+          this.dragSplit = true;
+          this.splitX = Math.min(1, Math.max(0, ix / this.img.width));
+          this.paint();
+          return;
+        }
+      }
       if (this.app.tool && this.img) {
         const p = this.toImg(e.clientX, e.clientY);
         this.toolActive = this.app.toolDown(p, e) !== false;
@@ -112,6 +130,12 @@ export class Viewer {
         return;
       }
       if (!start) return;
+      if (this.dragSplit) {
+        const [ix] = this.toImg(e.clientX, e.clientY);
+        this.splitX = Math.min(1, Math.max(0, ix / this.img.width));
+        this.paint();
+        return;
+      }
       const dx = e.clientX - start[0], dy = e.clientY - start[1];
       if (Math.hypot(dx, dy) > 8) { moved = true; clearTimeout(hold); }
       if (this.toolActive) { this.app.toolMove(this.toImg(e.clientX, e.clientY), e); return; }
@@ -123,6 +147,7 @@ export class Viewer {
       this.ptrs.delete(e.pointerId);
       clearTimeout(hold);
       if (pinch) { if (this.ptrs.size < 2) { pinch = null; start = null; if (this.z <= this.fitZ() * 1.02) { this.fitView(); this.apply(); this.app.onZoom(); } } return; }
+      if (this.dragSplit) { this.dragSplit = false; start = null; return; }
       if (this.toolActive) { this.toolActive = false; this.app.toolUp(this.toImg(e.clientX, e.clientY), e); start = null; return; }
       if (this.holding) { this.holding = false; this.paint(); start = null; return; }
       if (!moved && start && this.img) {
