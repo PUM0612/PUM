@@ -202,6 +202,7 @@ class App {
       if (myOpen !== this._open) { dec.src.close && dec.src.close(); return; }
       if (this.bitmap && this.bitmap.close) this.bitmap.close();
       this.bitmap = dec.src;
+      this.decWay = dec.apple ? 'Apple (Safari) — ảnh ProRAW của iPhone' : dec.libraw ? 'LibRaw (như PUM máy tính)' : dec.rawPreview ? 'ảnh xem trước nhúng trong RAW' : 'Safari';
       this.cur = p;
       this.fullW = dec.src.width; this.fullH = dec.src.height;
       const k = Math.min(1, PREVIEW_SIDE / Math.max(this.fullW, this.fullH));
@@ -642,7 +643,8 @@ class App {
       }
       return false;
     };
-    const kind = has('ftypheic') || has('ftypheix') || has('ftypmif1') ? 'HEIC' : head[0] === 0xff && head[1] === 0xd8 ? 'JPEG' : (blob.type || 'khác');
+    const kind = has('ftypheic') || has('ftypheix') || has('ftypmif1') ? 'HEIC' : head[0] === 0xff && head[1] === 0xd8 ? 'JPEG'
+      : /\.dng$/i.test(p.name) || /dng/i.test(blob.type) ? 'DNG (RAW)' : isRawName(p.name) ? 'RAW' : (blob.type || 'khác');
     const p3 = has('Display P3') || has('Display P3', true) || has('P3 D65');
     const gain = has('hdrgainmap') || has('HDRGainMap') || has('urn:iso:std:iso:ts:21496') || has('hdrgm');
     const W = 360, k = W / this.viewer.img.width, H = Math.round(this.viewer.img.height * k);
@@ -661,8 +663,9 @@ class App {
     const r1 = (v) => v.toFixed(1);
     this.openSheet('Kiểm tra độ sáng ảnh', h('div', {},
       h('div', { style: 'font-size:13px;margin-bottom:6px' }, `Tệp: ${kind} · ${(blob.size / 1e6).toFixed(1)} MB · màu ${p3 ? 'Display P3' : 'sRGB / không ghi'} · lớp HDR: ${gain ? 'CÓ' : 'không thấy'}`),
-      h('div', { style: 'font-size:13px;margin-bottom:6px' }, `Độ sáng TB (0–255): Safari ${r1(lA)} · PUM giải mã ${r1(lB)} · PUM hiển thị ${r1(lC)} · máy: ${navigator.userAgent.match(/OS [\d_]+/) ? navigator.userAgent.match(/OS [\d_]+/)[0].replace(/_/g, '.') : ''}`),
-      cell('A. Safari tự hiện tệp gốc', img), cell('B. PUM giải mã', cB), cell('C. PUM hiển thị (sau khi dựng)', cC),
+      h('div', { style: 'font-size:13px;margin-bottom:6px' }, `PUM giải mã bằng: ${this.decWay || '?'}`),
+      h('div', { style: 'font-size:13px;margin-bottom:6px' }, `Độ sáng TB (0–255): Safari ${r1(lA)} · Safari giải mã ${r1(lB)} · PUM hiển thị ${r1(lC)} · máy: ${navigator.userAgent.match(/OS [\d_]+/) ? navigator.userAgent.match(/OS [\d_]+/)[0].replace(/_/g, '.') : ''}`),
+      cell('A. Safari tự hiện tệp gốc', img), cell('B. Safari giải mã (createImageBitmap)', cB), cell('C. PUM hiển thị (sau khi dựng)', cC),
       hint('So 3 ảnh với ảnh đó trong app Ảnh. Chụp màn hình bảng này gửi lại để tìm đúng chỗ làm ảnh tối.')), true);
     this.onSheetClose = () => URL.revokeObjectURL(url);
     if (bmp && bmp.close) bmp.close();
