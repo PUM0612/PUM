@@ -625,6 +625,48 @@ class App {
       btn('Để sau', () => { this.closeSheet(); this.toast('Chưa có mô hình AI: vùng xoá được lấp tạm từ nền xung quanh', 4000); }),
       hint('Xoá mô hình để lấy lại chỗ trống: menu ☰ › Mô hình AI xoá vật thể.')));
   }
+  // Kiểm tra vì sao ảnh trông tối hơn app Ảnh. Hiện cạnh nhau, cùng cỡ:
+  // A = Safari tự hiện tệp gốc (thẻ <img>); B = PUM giải mã (createImageBitmap -> canvas); C = PUM sau khi dựng.
+  // Kèm thông tin tệp: loại, dải màu P3, có lớp HDR (gain map) không, độ sáng trung bình của B / C / A vẽ vào canvas.
+  async colorCheck() {
+    const p = this.cur;
+    if (!p || !this.viewer.img) return this.toast('Mở một ảnh trước');
+    const blob = await store.getFile(p.fileId || p.id);
+    const head = new Uint8Array(await blob.slice(0, Math.min(blob.size, 6 << 20)).arrayBuffer());
+    const has = (s, utf16) => {
+      const pat = [];
+      for (const ch of s) { if (utf16) pat.push(0); pat.push(ch.charCodeAt(0)); }
+      outer: for (let i = 0; i + pat.length <= head.length; i++) {
+        for (let k = 0; k < pat.length; k++) if (head[i + k] !== pat[k]) continue outer;
+        return true;
+      }
+      return false;
+    };
+    const kind = has('ftypheic') || has('ftypheix') || has('ftypmif1') ? 'HEIC' : head[0] === 0xff && head[1] === 0xd8 ? 'JPEG' : (blob.type || 'khác');
+    const p3 = has('Display P3') || has('Display P3', true) || has('P3 D65');
+    const gain = has('hdrgainmap') || has('HDRGainMap') || has('urn:iso:std:iso:ts:21496') || has('hdrgm');
+    const W = 360, k = W / this.viewer.img.width, H = Math.round(this.viewer.img.height * k);
+    const lum = (d) => { let s = 0; for (let i = 0; i < d.length; i += 4) s += d[i] * 0.2126 + d[i + 1] * 0.7152 + d[i + 2] * 0.0722; return s / (d.length / 4); };
+    const cv = (draw) => { const c = document.createElement('canvas'); c.width = W; c.height = H; c.style.cssText = 'width:100%;border-radius:6px'; const x = c.getContext('2d'); x.imageSmoothingQuality = 'high'; draw(x); return [c, lum(x.getImageData(0, 0, W, H).data)]; };
+    const url = URL.createObjectURL(blob);
+    const img = new Image(); img.src = url; img.style.cssText = 'width:100%;border-radius:6px;display:block';
+    try { await img.decode(); } catch (e) { /* bỏ qua */ }
+    let bmp = null;
+    try { bmp = await createImageBitmap(blob, { imageOrientation: 'from-image' }); } catch (e) { /* bỏ qua */ }
+    const [cA, lA] = cv((x) => x.drawImage(img, 0, 0, W, H));
+    const [cB, lB] = bmp ? cv((x) => x.drawImage(bmp, 0, 0, W, H)) : [h('div', {}, 'không giải mã được'), 0];
+    const vc = document.createElement('canvas'); vc.width = this.viewer.img.width; vc.height = this.viewer.img.height; vc.getContext('2d').putImageData(this.viewer.img, 0, 0);
+    const [cC, lC] = cv((x) => x.drawImage(vc, 0, 0, W, H));
+    const cell = (t, el) => h('div', { style: 'margin:6px 0' }, h('div', { style: 'font-size:13px;color:var(--fg2);margin-bottom:3px' }, t), el);
+    const r1 = (v) => v.toFixed(1);
+    this.openSheet('Kiểm tra độ sáng ảnh', h('div', {},
+      h('div', { style: 'font-size:13px;margin-bottom:6px' }, `Tệp: ${kind} · ${(blob.size / 1e6).toFixed(1)} MB · màu ${p3 ? 'Display P3' : 'sRGB / không ghi'} · lớp HDR: ${gain ? 'CÓ' : 'không thấy'}`),
+      h('div', { style: 'font-size:13px;margin-bottom:6px' }, `Độ sáng TB (0–255): Safari ${r1(lA)} · PUM giải mã ${r1(lB)} · PUM hiển thị ${r1(lC)} · máy: ${navigator.userAgent.match(/OS [\d_]+/) ? navigator.userAgent.match(/OS [\d_]+/)[0].replace(/_/g, '.') : ''}`),
+      cell('A. Safari tự hiện tệp gốc', img), cell('B. PUM giải mã', cB), cell('C. PUM hiển thị (sau khi dựng)', cC),
+      hint('So 3 ảnh với ảnh đó trong app Ảnh. Chụp màn hình bảng này gửi lại để tìm đúng chỗ làm ảnh tối.')), true);
+    this.onSheetClose = () => URL.revokeObjectURL(url);
+    if (bmp && bmp.close) bmp.close();
+  }
   aiMenu() {
     const ready = this.xvReady(), info = this.ai.info || {};
     this.openSheet('Mô hình AI xoá vật thể', h('div', { class: 'menu' },
@@ -1424,6 +1466,7 @@ class App {
       p ? btn('◫ So sánh trước / sau (cùng ảnh, hoặc với bản sao ảo)', async () => { const m = await import('./ui/library.js'); await this.saveCurrent(); m.compare(this, [p]); }) : null,
       clip.el,
       btn('🧽 Mô hình AI xoá vật thể' + (this.xvReady() ? ' (đã có)' : ' (chưa tải)'), () => this.aiMenu()),
+      p ? btn('🔎 Kiểm tra độ sáng ảnh (so với Safari)', () => this.colorCheck()) : null,
       btn('🗑 Gỡ ảnh đang xem khỏi app', () => this.removeCurrent()),
       btn('💾 Sao lưu thông số + style ra tệp', () => this.backup()),
       btn('♻️ Khôi phục từ tệp sao lưu', () => this.restore()),
