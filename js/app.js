@@ -223,12 +223,11 @@ class App {
     try { await store.putPhoto(p); } catch (e) { this.toast('Không lưu được: ' + e.message); }
   }
   saveSoon() {
+    // thông số lưu NGAY (ghi IndexedDB rất nhẹ) — đóng / tải lại app ngay sau khi chỉnh vẫn không mất;
+    // chỉ thumbnail + dải ảnh là cập nhật sau một nhịp
+    this.saveCurrent();
     clearTimeout(this._sv);
-    this._sv = setTimeout(async () => {
-      await this.saveCurrent();
-      this.updateThumb();
-      this.renderStrip();
-    }, 400);
+    this._sv = setTimeout(() => { this.updateThumb(); this.renderStrip(); }, 600);
   }
   async updateThumb() {
     if (!this.cur || !this.viewer.img || this.tool === 'crop') return;
@@ -237,7 +236,9 @@ class App {
     c.getContext('2d').putImageData(this.viewer.img, 0, 0);
     const t = await this.makeThumb(null, c);
     const p = this.cur;
-    p.thumb = t; if (p._url) URL.revokeObjectURL(p._url); p._url = null;
+    const old = p._url;
+    p.thumb = t; p._url = null;
+    if (old) setTimeout(() => URL.revokeObjectURL(old), 5000);     // đợi ảnh cũ trên dải ảnh được thay xong
     store.putPhoto(p).catch(() => {});
   }
 

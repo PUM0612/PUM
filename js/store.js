@@ -32,13 +32,20 @@ function tx(store, mode, fn) {
 // Blob được lưu dạng ArrayBuffer (WebKit không cho lưu Blob vào IndexedDB ở một số chế độ — riêng tư, WebView)
 const toRec = async (b) => (b ? { buf: await b.arrayBuffer(), type: b.type || '' } : null);
 const toBlob = (r) => (r && r.buf ? new Blob([r.buf], { type: r.type }) : r || null);
-const fixPhoto = (p) => { if (p && p.thumb && p.thumb.buf) p.thumb = toBlob(p.thumb); return p; };
+const fixPhoto = (p) => {
+  if (p && p.thumb && p.thumb.buf) { const rec = p.thumb; p.thumb = toBlob(rec); p._thumbRec = { blob: p.thumb, rec }; }
+  return p;
+};
 export const store = {
   photos: async () => ((await tx('photos', 'readonly', (s) => s.getAll())) || []).map(fixPhoto),
   putPhoto: async (p) => {
     const rec = Object.assign({}, p);
-    delete rec._url;
-    if (rec.thumb instanceof Blob) rec.thumb = await toRec(rec.thumb);
+    delete rec._url; delete rec._thumbRec;
+    // thumbnail đổi sang ArrayBuffer một lần rồi giữ lại -> các lần lưu thông số sau ghi ngay, không phải chờ
+    if (rec.thumb instanceof Blob) {
+      if (!(p._thumbRec && p._thumbRec.blob === rec.thumb)) p._thumbRec = { blob: rec.thumb, rec: await toRec(rec.thumb) };
+      rec.thumb = p._thumbRec.rec;
+    }
     return tx('photos', 'readwrite', (s) => s.put(rec));
   },
   delPhotoOnly: (id) => tx('photos', 'readwrite', (s) => s.delete(id)),

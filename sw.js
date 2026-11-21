@@ -1,6 +1,6 @@
 // Service worker PUM iPhone — tạo tự động bởi tools/phat_hanh.py (đừng sửa tay).
 // Đổi phiên bản (js/version.js) rồi chạy lại phat_hanh.py: iPhone tự tải bản mới ở lần mở kế tiếp.
-const CACHE = 'pum-1.1.0';
+const CACHE = 'pum-1.1.1';
 const FILES = [
   "./",
   "index.html",
