@@ -3,7 +3,7 @@
 // Gắn COOP / COEP vào mọi trang + tệp (GitHub Pages không cho đặt header): trang "cô lập" -> AI xoá vật thể chạy
 // được nhiều luồng. Mô hình AI (models/lama/) không nằm trong bộ đệm này: app tự tải khi người dùng đồng ý và giữ ở
 // bộ đệm riêng "ai-lama-..." (không bị xoá khi cập nhật app).
-const CACHE = 'pum-1.1.1-b65d5d70';
+const CACHE = 'pum-1.1.2-6248563d';
 const FILES = [
   "./",
   "index.html",

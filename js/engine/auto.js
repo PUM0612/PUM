@@ -1,7 +1,7 @@
 // Nút Auto cho từng nhóm chỉnh — chép theo autoadj.py của PUM máy tính.
 // autoSection(key, img, s, ctx) -> { up: [[đường dẫn, giá trị], ...], msg }
 import * as E from './engine.js';
-import { BANDS, SKIN_HUE } from './settings.js';
+import { BANDS, SKIN_HUE, defaultSettings } from './settings.js';
 
 const cv = E.cv;
 const clip = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -22,9 +22,9 @@ function hsvOf(img) {
 }
 function std(a) { let m = 0; for (const v of a) m += v; m /= a.length; let q = 0; for (const v of a) q += (v - m) ** 2; return Math.sqrt(q / a.length); }
 
-function autoColor(img, s) {
+function autoColor(img, s, ctx = {}) {
   const sm = small(img);
-  const [t, tn] = E.autoWb(sm);
+  const [t, tn] = E.autoWb(sm, ctx.faces);             // có mặt người: cân theo màu da + màu trắng (như bảng Capture One)
   const s2 = zero(Object.assign({}, s, { temp: t, tint: tn }), ['vibrance', 'saturation']);
   const { S, V, n } = hsvOf(preColor(sm, s2));
   let sum = 0, c = 0;
@@ -38,7 +38,7 @@ function autoColor(img, s) {
 function autoTone(img, s) {
   const sm = small(img);
   const s0 = zero(s, [...TONE_KEYS, 'clarity', 'dehaze']);
-  const d = E.autoTone(preColor(sm, s0));
+  const d = E.autoToneLr(preColor(sm, s0));
   const s1 = Object.assign({}, s0, d);
   const st = std(E.lum(preColor(sm, s1)).d);
   d.contrast = R(clip((0.22 - st) / 0.22 * 90, -25, 35));
@@ -214,6 +214,24 @@ function autoNr(img, s, ctx) {
     msg: `Khử nhiễu độ sáng ${R(l)}, màu ${c} (độ nhiễu đo được ~${n.toFixed(1)})` };
 }
 
+// Nút "Tự động" của PUM 1.1.2 (main.py act 'auto'): phơi sáng + Highlights như "Bảng điều khiển Capture One", đo trên
+// ảnh ĐÃ cân bằng trắng, chưa cuộn vùng sáng; ảnh ISO cao (>= 1600, hoặc không rõ ISO mà nhiễu rõ) thì khử nhiễu luôn.
+function autoC1(img, s, ctx) {
+  const wbOnly = Object.assign(defaultSettings(), { temp: s.temp, tint: s.tint });
+  const d = E.autoTone(E.wbExpo(cv.clone(img), wbOnly), ctx.faces);
+  const up = Object.entries(d).map(([k, v]) => [[k], v]);
+  let nrMsg = '';
+  const iso = ctx.iso ?? null;
+  if (iso === null || iso >= 1600) {
+    const s1 = Object.assign({}, s, d);
+    const r = autoNr(img, s1, ctx);
+    let want = (r.up.find(([p]) => p[0] === 'nr_lum') || [null, 0])[1];
+    if (iso === null) want = want >= 30 ? want : 0;
+    if (want >= 10 && (s.nr_lum || 0) < want) { up.push(...r.up); nrMsg = `, khử nhiễu ${want}`; }
+  }
+  return { up, msg: `Phơi sáng ${sgn(d.exposure, 2)}, Highlights ${d.highlights}${nrMsg}` + (ctx.faces && ctx.faces.length ? ' (theo da mặt)' : '') };
+}
+
 function regionMean(L, x0, y0, x1, y1) {
   let s = 0, c = 0;
   for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) { s += L.d[y * L.w + x]; c++; }
@@ -316,7 +334,7 @@ function autoPortrait(fold, img, s, ctx) {
 const AUTO = {
   color: autoColor, tone: autoTone, presence: autoPresence, hsl: autoHsl, skin: autoSkin, calib: autoCalib,
   grading: autoGrading, curve: autoCurve, layer: autoLayer, sharpen: autoSharpen, nr: autoNr, effects: autoEffects,
-  lens: autoLens, straighten: autoStraighten,
+  lens: autoLens, straighten: autoStraighten, c1: autoC1,
   skin_smooth: () => ({ up: [[['retouch', 'skin_auto'], true], [['retouch', 'skin_amount'], 35], [['retouch', 'skin_texture'], 55]],
     msg: 'Làm mịn da 35 trên mọi vùng da tự nhận, giữ kết cấu 55' }),
   keystone: () => ({ up: [], msg: 'Bản iPhone chưa có tự dựng thẳng phối cảnh — kéo thanh "Dọc" / "Ngang" bằng tay' }),

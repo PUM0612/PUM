@@ -13,13 +13,16 @@ import { XoaAI, MODEL_BYTES } from './xoa_ai.js';
 
 const PREVIEW_SIDE = 1600, DRAFT_SIDE = 640, THUMB = 240;
 const XV_VARIANTS = 4;          // số cách lấp của Xoá vật thể AI (xoa_vat.js VARIANTS)
+// cách lấp 3 của PUM máy tính 1.1.2 = "AI còn lại" (RORem trên card đồ hoạ); iPhone chỉ có LaMa -> bỏ qua cách đó
+const XV_USE = [0, 1, 3];
+const xvIdx = (v) => Math.max(0, XV_USE.indexOf(v | 0)) + 1;
 // Đặt lại nhiều mức (main.py GEOM_KEYS / RESET_KINDS) + khoá của từng tab (panels.reset_tab)
 const GEOM_KEYS = ['rotate', 'straighten', 'crop', 'crop_rect', 'flip', 'lens', 'crop_outside'];
 const RESET_KINDS = { all: 'Đặt lại toàn bộ', color_tone: 'Đặt lại màu & tông', geometry: 'Đặt lại khung cắt / xoay / ống kính',
   retouch: 'Xoá retouch', portrait: 'Đặt lại chân dung', layers: 'Xoá mọi layer' };
 const TAB_KEYS = {
-  basic: ['temp', 'tint', 'vibrance', 'saturation', 'exposure', 'contrast', 'brightness', 'highlights', 'shadows', 'whites', 'blacks',
-    'texture', 'clarity', 'dehaze'],
+  basic: ['temp', 'tint', 'vibrance', 'saturation', 'depth', 'film_color', 'exposure', 'contrast', 'brightness', 'highlights', 'shadows',
+    'whites', 'blacks', 'texture', 'clarity', 'dehaze'],
   color: ['color', 'color_adv', 'skin', 'calib'], grading: ['grading'], curve: ['curve'],
   detail: ['sharpen', 'sharpen_radius', 'nr_lum', 'nr_lum_detail', 'nr_lum_contrast', 'nr_color', 'nr_color_detail', 'nr_color_smooth',
     'vignette', 'grain', 'grain_size'],
@@ -205,6 +208,7 @@ class App {
       this.decWay = dec.appleLut ? 'LibRaw + khớp theo ảnh Apple nhúng (ProRAW của iPhone)' : dec.apple ? 'LibRaw + bù phơi sáng gốc (ProRAW, không thấy ảnh nhúng)'
         : dec.libraw ? 'LibRaw (như PUM máy tính)' : dec.rawPreview ? 'ảnh xem trước nhúng trong RAW' : 'Safari';
       this.cur = p;
+      this.iso = dec.iso ?? null;            // ISO đọc từ EXIF (nút Tự động: khử nhiễu khi ISO >= 1600)
       this.fullW = dec.src.width; this.fullH = dec.src.height;
       const k = Math.min(1, PREVIEW_SIDE / Math.max(this.fullW, this.fullH));
       const pw = Math.max(1, Math.round(this.fullW * k)), ph = Math.max(1, Math.round(this.fullH * k));
@@ -855,7 +859,7 @@ class App {
     const rt = this.s.retouch;
     if (this.selArea >= 0 && rt.areas[this.selArea]) {
       const a = rt.areas[this.selArea];
-      const extra = a.kind === 'remove' && this.xvReady() ? ` · AI dựng lại nền · cách lấp ${(a.v | 0) + 1}/${XV_VARIANTS}` : '';
+      const extra = a.kind === 'remove' && this.xvReady() ? ` · AI dựng lại nền · cách lấp ${xvIdx(a.v)}/${XV_USE.length}` : '';
       return { kind: 'area', i: this.selArea, o: a, label: ({ heal: 'Heal', clone: 'Clone', remove: 'Xoá vật thể' }[a.kind] || 'Vùng') + ' #' + (this.selArea + 1) + extra };
     }
     if (this.selSpot >= 0 && rt.spots[this.selSpot]) { const s = rt.spots[this.selSpot]; return { kind: 'spot', i: this.selSpot, o: s, label: ({ dust: 'Vết bụi', heal: 'Điểm heal', clone: 'Điểm clone' }[s.type] || 'Điểm') + ' #' + (this.selSpot + 1) }; }
@@ -981,9 +985,10 @@ class App {
       const a = sel.o;
       this.begin('Thử cách lấp khác');
       a.v = ((a.v | 0) + 1) % XV_VARIANTS;
+      if (!XV_USE.includes(a.v)) a.v = (a.v + 1) % XV_VARIANTS;
       delete a.off; delete a.cands; delete a.ci; delete a.fill;
       this.end(); this.drawOverlay();
-      this.toast(`Cách lấp ${a.v + 1}/${XV_VARIANTS} — AI đang dựng lại nền…`, 2500);
+      this.toast(`Cách lấp ${xvIdx(a.v)}/${XV_USE.length} — AI đang dựng lại nền…`, 2500);
       return;
     }
     if (sel && sel.kind === 'area' && sel.o.kind === 'remove' && !(sel.o.cands || []).length) return this.offerAI();
@@ -1127,16 +1132,18 @@ class App {
   async auto(key) {
     if (!this.cur) return this.toast('Chưa mở ảnh nào');
     if (key === 'wb') {
+      await this.ensureFaces();               // có mặt người: cân theo màu da + màu trắng (như bảng Capture One)
       const r = await this.call('auto', { id: this.cur.id, key: 'color', settings: this.s });
       const up = r.res.up.filter(([p]) => p[0] === 'temp' || p[0] === 'tint');
       this.begin('Cân bằng trắng tự động'); for (const [p, v] of up) this.set(p, v); this.end();
       this.wbMode = 'auto'; this.panels.sync();
       return this.toast(`Cân bằng trắng tự động: ${up.map(([, v]) => v).join(' / ')}`);
     }
+    if (key === 'color' || key === 'c1') await this.ensureFaces();    // cân màu / phơi sáng theo da mặt
     this.busy(true);
     try {
-      const r = await this.call('auto', { id: this.cur.id, key, settings: this.s, layer: this.layerIdx });
-      this.begin('Auto ' + key);
+      const r = await this.call('auto', { id: this.cur.id, key, settings: this.s, layer: this.layerIdx, iso: this.iso });
+      this.begin(key === 'c1' ? 'Tự động' : 'Auto ' + key);
       for (const [p, v] of r.res.up) this.set(p, v);
       this.end();
       this.toast(r.res.msg, 3500);
@@ -1233,9 +1240,11 @@ class App {
     const msgs = [];
     try {
       this.begin(label);
-      for (const key of keys) {                       // lần lượt: nhóm sau đo trên ảnh đã có nhóm trước
-        const r = await this.call('auto', { id: this.cur.id, key, settings: this.s, layer: this.layerIdx });
-        for (const [p, v] of r.res.up) this.set(p, v);
+      for (const key0 of keys) {                      // lần lượt: nhóm sau đo trên ảnh đã có nhóm trước
+        const wbOnly = key0 === 'wb';                 // 'wb' = chỉ lấy nhiệt độ màu / tint của Auto nhóm Màu
+        const key = wbOnly ? 'color' : key0;
+        const r = await this.call('auto', { id: this.cur.id, key, settings: this.s, layer: this.layerIdx, iso: this.iso });
+        for (const [p, v] of r.res.up) if (!wbOnly || p[0] === 'temp' || p[0] === 'tint') this.set(p, v);
         msgs.push(r.res.msg);
       }
       this.end();
@@ -1243,9 +1252,13 @@ class App {
     this.busy(false);
     return msgs;
   }
+  // như PUM máy tính 1.1.2: Cân bằng trắng Tự động (theo màu da + màu trắng) rồi nút Tự động (phơi sáng + vùng sáng như
+  // bảng Capture One, khử nhiễu khi ISO cao)
   async autoAll() {
-    const m = await this.autoSome(['color', 'tone', 'presence'], 'Tự động chỉnh ảnh');
-    if (m) this.toast('Đã tự cân màu, sáng tối và độ trong', 2500);
+    if (!this.cur) return this.toast('Chưa mở ảnh nào');
+    await this.ensureFaces();
+    const m = await this.autoSome(['wb', 'c1'], 'Tự động chỉnh ảnh');
+    if (m) { this.wbMode = 'auto'; this.panels.sync(); this.toast('Đã tự cân màu theo da và sáng tối như Capture One — áp thêm style "Gu Capture One (Cơ bản)" nếu muốn', 3500); }
   }
   async autoFace() {
     if (!this.cur) return this.toast('Chưa mở ảnh nào');

@@ -34,6 +34,35 @@ export function needsPerson(p) {
   return ['hair_outer', 'hair_dark', 'body_even', 'cloth_wrinkle', 'cloth_spots', 'cloth_edges', 'body_slim'].some((k) => p[k]) ||
     (['all', 'body'].includes(p.tone_target) && (['tone_uniform', 'tone_temp', 'tone_tint', 'tone_sat', 'tone_light', 'tone_pref'].some((k) => p[k]) || (p.tone_preset || 'none') !== 'none'));
 }
+// Da mặt (bầu mặt trừ mắt, mày, môi), co 3x3 — dùng cho cân bằng trắng / Tự động theo da mặt (engine.face_skin_rgb,
+// face_skin_stats của PUM 1.1.2: P = (điểm mốc x cỡ ảnh) lấy phần nguyên, cv2.fillPoly, cv2.erode 3x3).
+export function faceSkinMask(w, h, lm) {
+  const P = (i) => [Math.trunc(lm[i * 2] * w), Math.trunc(lm[i * 2 + 1] * h)];
+  const a = P(234), b = P(454), fw = Math.hypot(a[0] - b[0], a[1] - b[1]);
+  if (fw < 20) return { fw, mask: null };
+  const o = poly(w, h, OVAL.map(P));
+  for (const idx of [EYE_IMG_LEFT, EYE_IMG_RIGHT, BROW_L, BROW_R, LIPS_OUT]) {
+    const q = poly(w, h, idx.map(P));
+    for (let i = 0; i < o.length; i++) if (q[i]) o[i] = 0;
+  }
+  const e = new Uint8Array(w * h);                 // cv2.erode 3x3: ngoài viền ảnh không làm co
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    if (!o[y * w + x]) continue;
+    let ok = 1;
+    for (let dy = -1; dy <= 1 && ok; dy++) {
+      const yy = y + dy;
+      if (yy < 0 || yy >= h) continue;
+      for (let dx = -1; dx <= 1; dx++) {
+        const xx = x + dx;
+        if (xx < 0 || xx >= w) continue;
+        if (!o[yy * w + xx]) { ok = 0; break; }
+      }
+    }
+    e[y * w + x] = ok;
+  }
+  return { fw, mask: e };
+}
+
 export function faceBoxes(faces) {
   return faces.map((lm) => {
     let x0 = 1, y0 = 1, x1 = 0, y1 = 0;
@@ -268,7 +297,9 @@ function sub3(im, x0, y0, x1, y1) {
 function put3(im, part, x0, y0) { for (let y = 0; y < part.h; y++) im.d.set(part.d.subarray(y * part.w * 3, (y + 1) * part.w * 3), ((y + y0) * im.w + x0) * 3); }
 
 // src: chỉ lấy MÀU lấp từ vùng này (VD chỉ nền khi xoá tóc con: không kéo màu tóc tối ra nền)
-function fillSpots(reg, mask, fw, texShift = true, srcok = null, src = null) {
+// srcok (PUM 1.1.2): vết nhỏ cũng chỉ lấy MÀU lấp từ vùng này (sát tóc / áo không kéo màu tối vào da)
+// noDarken: mụn / sợi tóc là chỗ TỐI hơn da: chỗ lấp ra tối hơn chỗ cũ là nhận nhầm -> để nguyên
+function fillSpots(reg, mask, fw, texShift = true, srcok = null, src = null, noDarken = false) {
   const { w: W, h: H } = reg;
   const { n, lab, stats } = components(mask, W, H);
   if (n <= 1) return reg;
@@ -312,14 +343,71 @@ function fillSpots(reg, mask, fw, texShift = true, srcok = null, src = null) {
         for (let k = 0; k < 3; k++) fill.d[q * 3 + k] = nb[q * 3 + k] / Math.max(db[q], 1e-4);
       }
     } else if (thick <= 40) {
-      const outm = new Float32Array(cw * chh); for (let q = 0; q < outm.length; q++) outm[q] = ins[q] ? 0 : 1;
-      const sg = Math.max(1, 0.6 * thick);
+      // vết nhỏ / mảnh (mụn, sợi tóc): trung bình có trọng số từ viền theo ĐỘ DÀY của vết; chỉ lấy màu từ da khi biết
+      const okm = new Uint8Array(cw * chh);
+      for (let q = 0; q < okm.length; q++) okm[q] = ins[q] ? 0 : 1;
+      if (srcok) {
+        for (let yy = 0; yy < chh; yy++) for (let xx = 0; xx < cw; xx++) {
+          const q = yy * cw + xx;
+          if (okm[q] && !(srcok[(yy + ya) * W + xx + xa] > 0.5)) okm[q] = 0;
+        }
+        const ring = and(dil(ins, cw, chh, Math.max(2, 0.5 * thick)), not(ins));
+        let rc = 0, rk = 0;
+        for (let q = 0; q < ring.length; q++) if (ring[q]) { rc++; if (okm[q]) rk++; }
+        if (rc && rk / rc < 0.6) continue;     // quanh vết phần lớn không phải da: để nguyên
+      }
+      const outm = new Float32Array(cw * chh); for (let q = 0; q < outm.length; q++) outm[q] = okm[q];
+      let sg = Math.max(1, 0.6 * thick);
       const num = { w: cw, h: chh, c: 3, d: new Float32Array(cw * chh * 3) };
       for (let q = 0; q < outm.length; q++) for (let k = 0; k < 3; k++) num.d[q * 3 + k] = crop.d[q * 3 + k] * outm[q];
-      const nb = cv.gaussianBlur(num, sg).d, db = cv.gaussianBlur(cv.img1(cw, chh, outm), sg).d;
+      let nb = cv.gaussianBlur(num, sg).d, db = cv.gaussianBlur(cv.img1(cw, chh, outm), sg).d;
+      for (let it = 0; it < 2; it++) {
+        let mn = Infinity; for (let q = 0; q < db.length; q++) if (ins[q] && db[q] < mn) mn = db[q];
+        if (mn > 0.02) break;
+        sg *= 2;
+        nb = cv.gaussianBlur(num, sg).d; db = cv.gaussianBlur(cv.img1(cw, chh, outm), sg).d;
+      }
       fill = { w: cw, h: chh, c: 3, d: Float32Array.from(crop.d) };
       for (let q = 0; q < outm.length; q++) if (ins[q]) for (let k = 0; k < 3; k++) fill.d[q * 3 + k] = nb[q * 3 + k] / Math.max(db[q], 1e-4);
+      // da quanh vết đang chuyển sáng tối (má nghiêng, mép bóng): lấp bằng MẶT NGHIÊNG khớp theo vành quanh vết
+      const band = and(dil(ins, cw, chh, Math.max(2, 0.6 * thick + 1)), okm);
+      let cnt = 0, sx = 0, sy = 0, sxx = 0, sxy = 0, syy = 0;
+      const bx = [0, 0, 0], bxx = [0, 0, 0], byy = [0, 0, 0];
+      for (let yy = 0; yy < chh; yy++) for (let xx = 0; xx < cw; xx++) {
+        const q = yy * cw + xx;
+        if (!band[q]) continue;
+        cnt++; sx += xx; sy += yy; sxx += xx * xx; sxy += xx * yy; syy += yy * yy;
+        for (let k = 0; k < 3; k++) { const v = crop.d[q * 3 + k]; bx[k] += v; bxx[k] += xx * v; byy[k] += yy * v; }
+      }
+      if (cnt >= 12) {
+        const Mi = inv3n([[cnt, sx, sy], [sx, sxx, sxy], [sy, sxy, syy]]);
+        if (Mi) {
+          const coef = [0, 1, 2].map((k) => [0, 1, 2].map((r) => Mi[r][0] * bx[k] + Mi[r][1] * bxx[k] + Mi[r][2] * byy[k]));
+          let res = 0;
+          for (let yy = 0; yy < chh; yy++) for (let xx = 0; xx < cw; xx++) {
+            const q = yy * cw + xx;
+            if (!band[q]) continue;
+            for (let k = 0; k < 3; k++) res += Math.abs(f32(f32(coef[k][0] + f32(coef[k][1] * xx)) + f32(coef[k][2] * yy)) - crop.d[q * 3 + k]);
+          }
+          if (res / (cnt * 3) < 0.04) {          // vành đủ "phẳng-nghiêng" để mặt nghiêng tin được
+            for (let yy = 0; yy < chh; yy++) for (let xx = 0; xx < cw; xx++) {
+              const q = yy * cw + xx;
+              if (ins[q]) for (let k = 0; k < 3; k++) fill.d[q * 3 + k] = coef[k][0] + coef[k][1] * xx + coef[k][2] * yy;
+            }
+          }
+        }
+      }
     } else fill = laplaceFill(crop, ins);
+    if (noDarken) {
+      let fs = 0, cs = 0, nn = 0;
+      for (let q = 0; q < ins.length; q++) {
+        if (!ins[q]) continue;
+        fs += fill.d[q * 3] * 0.299 + fill.d[q * 3 + 1] * 0.587 + fill.d[q * 3 + 2] * 0.114;
+        cs += crop.d[q * 3] * 0.299 + crop.d[q * 3 + 1] * 0.587 + crop.d[q * 3 + 2] * 0.114;
+        nn++;
+      }
+      if (nn && fs / nn < cs / nn - 0.012) continue;      // lấp ra tối hơn: không phải mụn / sợi tóc tối -> để nguyên
+    }
     if (texShift) {
       const d = Math.trunc(Math.max(w, h) + mg);
       for (const [ox, oy] of [[d, 0], [-d, 0], [0, d], [0, -d]]) {
@@ -342,26 +430,83 @@ function fillSpots(reg, mask, fw, texShift = true, srcok = null, src = null) {
   return out;
 }
 
+// ma trận 3x3 nghịch đảo (số thực 64 bit); null nếu suy biến
+function inv3n(m) {
+  const [a, b, c] = m[0], [d, e, f] = m[1], [g, h, i] = m[2];
+  const A = e * i - f * h, B = -(d * i - f * g), C = d * h - e * g, det = a * A + b * B + c * C;
+  if (!Number.isFinite(det) || Math.abs(det) < 1e-12) return null;
+  return [[A / det, -(b * i - c * h) / det, (b * f - c * e) / det],
+    [B / det, (a * i - c * g) / det, -(a * f - c * d) / det],
+    [C / det, -(a * h - b * g) / det, (a * e - b * d) / det]];
+}
+
+const SPOT_CONT_K = 0.8, SPOT_CONT_F = 0.55;   // vết "kéo dài" (bóng gọng kính, dải bóng): hai hướng đối nhau quanh vết vẫn tối
+const SPOT_SLOPE = 4.0;                        // vết trên dốc sáng tối: độ dốc > SPOT_SLOPE x độ tối của vết -> bỏ
+// portrait._band_like: chỗ tối quanh vết (vành cách 0,5–1,5 cỡ vết) dồn vào hai hướng ĐỐI NHAU -> vết là một đoạn dải bóng
+function bandLike(hi, x, y, bw, bh, lab, i, sk, W, H) {
+  const r = Math.max(bw, bh), mg = Math.trunc(Math.max(3, 1.6 * r));
+  const ya = Math.max(0, y - mg), yb = Math.min(H, y + bh + mg), xa = Math.max(0, x - mg), xb = Math.min(W, x + bw + mg);
+  const cw = xb - xa, chh = yb - ya, comp = new Uint8Array(cw * chh);
+  let cy = 0, cx = 0, cn = 0;
+  for (let yy = 0; yy < chh; yy++) for (let xx = 0; xx < cw; xx++) if (lab[(yy + ya) * W + xx + xa] === i) { comp[yy * cw + xx] = 1; cy += yy; cx += xx; cn++; }
+  cy /= cn; cx /= cn;
+  const d1 = dil(comp, cw, chh, Math.max(2, 1.2 * r)), d0 = dil(comp, cw, chh, Math.max(1, 0.4 * r));
+  const cnt = new Float64Array(12), s = new Float64Array(12);
+  let rn = 0;
+  for (let yy = 0; yy < chh; yy++) for (let xx = 0; xx < cw; xx++) {
+    const q = yy * cw + xx, gi = (yy + ya) * W + xx + xa;
+    if (!d1[q] || d0[q] || !sk[gi]) continue;
+    rn++;
+    const ang = (Math.atan2(yy - cy, xx - cx) + Math.PI) / (2 * Math.PI) * 12;
+    const b = Math.min(11, Math.max(0, Math.trunc(ang)));
+    cnt[b]++; s[b] += hi[gi];
+  }
+  if (rn < 12) return false;
+  for (let k = 0; k < 12; k++) s[k] /= Math.max(cnt[k], 1);
+  let pair = -Infinity;
+  for (let k = 0; k < 12; k++) pair = Math.max(pair, Math.min(Math.max(s[k], s[(k + 1) % 12]), Math.max(s[(k + 6) % 12], s[(k + 7) % 12])));
+  const so = Array.from(s).sort((p, q) => p - q), med = (so[5] + so[6]) / 2;
+  return pair > SPOT_CONT_F && pair > 2.5 * med + 0.05;
+}
+
 function spotMask(Y, Cr, skin, w, h, fw, amount, lightToo = false, skinlike = null) {
   const s1 = Math.max(0.6, fw * 0.004), s2 = Math.max(2, fw * 0.025);
-  const Yb2 = blur1(Y, w, h, s2), Yb1 = blur1(Y, w, h, s1), Cb1 = blur1(Cr, w, h, s1), Cb2 = blur1(Cr, w, h, s2);
-  const n = w * h, dark = new Float32Array(n), red = new Float32Array(n);
-  for (let i = 0; i < n; i++) { dark[i] = Yb2[i] - Yb1[i]; red[i] = Cb1[i] - Cb2[i]; }
+  const n = w * h;
   const sk = []; for (let i = 0; i < n; i++) if (skin[i] > 0.5) sk.push(i);
   if (sk.length < 50) return new Uint8Array(n);
+  // nền so sánh (làm mờ rộng) CHỈ lấy trên da: sát mép tóc / áo mà lấy cả tóc tối thì da sạch cạnh đó trông như "chấm
+  // khác thường" -> nhận nhầm mụn, lấp ra chấm xám (PUM 1.1.2)
+  const skm = new Float32Array(n); for (const i of sk) skm[i] = 1;
+  const den = blur1(skm, w, h, s2); for (let i = 0; i < n; i++) den[i] = Math.max(den[i], 1e-3);
+  const nbF = (a) => { const t = new Float32Array(n); for (let i = 0; i < n; i++) t[i] = a[i] * skm[i]; const b = blur1(t, w, h, s2); for (let i = 0; i < n; i++) b[i] = b[i] / den[i]; return b; };
+  const nY = nbF(Y), Yb1 = blur1(Y, w, h, s1), Cb1 = blur1(Cr, w, h, s1), nC = nbF(Cr);
+  const Yb2 = skinlike ? blur1(Y, w, h, s2) : null;
+  const dark = new Float32Array(n), red = new Float32Array(n);
+  for (let i = 0; i < n; i++) { dark[i] = nY[i] - Yb1[i]; red[i] = Cb1[i] - nC[i]; }
   const zf = (a) => { const v = sk.map((i) => a[i]); const med = median(v); const mad = median(v.map((x) => Math.abs(x - med))) * 1.48 + 1e-5; return [med, mad]; };
   const [md, ad] = zf(dark), [mr, ar] = zf(red);
   const thr = 4.2 - 2.4 * amount;
-  const m = new Uint8Array(n);
+  const m = new Uint8Array(n), hiS = new Float32Array(n), skB = new Uint8Array(n);
+  const thrK = f32(SPOT_CONT_K * thr);
   for (let i = 0; i < n; i++) {
-    if (!(skin[i] > 0.5)) continue;
     let sc = Math.max((dark[i] - md) / ad, 0.8 * (red[i] - mr) / ar);
     if (lightToo) sc = Math.max(sc, (-dark[i] + md) / ad);
+    sc = f32(sc);
+    hiS[i] = sc > thrK ? 1 : 0;
+    if (!(skin[i] > 0.5)) continue;
+    skB[i] = 1;
     if (sc > thr) m[i] = 1;
   }
   const { n: nc, lab, stats } = components(m, w, h);
-  const maxd = fw * (0.03 + 0.05 * amount);
+  // mụn thật nhỏ (<= ~3% bề rộng mặt); mảng tối to hơn thường là bóng (gọng kính, cánh mũi) bị cắt thành cục
+  const maxd = fw * (0.02 + 0.025 * amount);
   const keep = new Uint8Array(nc);
+  let slope = null;
+  if (skinlike) {
+    // độ dốc sáng tối của da ở cỡ lớn (chỉ trên da): mép bóng gọng kính / cánh mũi / cằm thì dốc mạnh
+    slope = cv.sobelMag(nY, w, h);
+    for (let i = 0; i < n; i++) slope[i] = slope[i] / 8.0 * (2.0 * s2);
+  }
   for (let i = 1; i < nc; i++) {
     const [x, y, bw, bh, area] = stats[i];
     if (Math.max(bw, bh) > maxd) continue;
@@ -372,15 +517,23 @@ function spotMask(Y, Cr, skin, w, h, fw, amount, lightToo = false, skinlike = nu
       const cw = xb - xa, chh = yb - ya, comp = new Uint8Array(cw * chh);
       for (let yy = 0; yy < chh; yy++) for (let xx = 0; xx < cw; xx++) comp[yy * cw + xx] = lab[(yy + ya) * w + xx + xa] === i ? 1 : 0;
       const ring = and(dil(comp, cw, chh, Math.max(2, 0.4 * Math.max(bw, bh))), not(comp));
-      let rs = 0, rk = 0, rn = 0, drop = 0, cn = 0;
+      let rs = 0, rk = 0, rn = 0, drop = 0, cn = 0, sl = 0;
+      const rv = [];
       for (let q = 0; q < ring.length; q++) {
         const gi = (Math.floor(q / cw) + ya) * w + (q % cw) + xa;
-        if (ring[q]) { rs += skinlike[gi]; rk += skin[gi] > 0.5 ? 1 : 0; rn++; }
-        if (comp[q]) { drop += Yb2[gi] - Y[gi]; cn++; }
+        if (ring[q]) { rs += skinlike[gi]; rk += skin[gi] > 0.5 ? 1 : 0; rn++; rv.push(Yb2[gi]); }
+        if (comp[q]) { drop += Yb2[gi] - Y[gi]; sl += slope[gi]; cn++; }
       }
-      if (!rn || rs / rn < 0.45) continue;
-      if (rk / rn < 0.9) continue;
-      if (cn && drop / cn > 0.22) continue;
+      if (!rn || rs / rn < 0.45) continue;      // không có da bao quanh: trang sức, mép tóc, viền áo...
+      if (rk / rn < 0.9) continue;              // nằm sát mép vùng da (mép áo, tóc, khoé mắt)
+      const dr = cn ? drop / cn : 0;
+      if (dr > 0.22) continue;                  // quá tối: lỗ, mặt dây chuyền, bóng đổ sâu
+      // nằm trên MÉP BÓNG (cánh mũi, gọng kính, cằm): vành quanh vết nửa sáng nửa tối -> lấp sẽ ra mảng vỡ
+      if (rv.length > 8 && pct(rv, 90) - pct(rv, 10) > Math.max(0.05, 1.6 * Math.max(dr, 0))) continue;
+      // bóng gọng kính / dải bóng / nếp: chỗ tối KÉO DÀI ra ngoài vết theo HAI PHÍA ĐỐI NHAU
+      if (bandLike(hiS, x, y, bw, bh, lab, i, skB, w, h)) continue;
+      const slm = cn ? sl / cn : 0;
+      if (slm > SPOT_SLOPE * Math.max(dr, 0.01) && slm > 0.05) continue;   // nằm trên dốc sáng tối (mép bóng)
     }
     keep[i] = 1;
   }
@@ -570,17 +723,24 @@ function even(reg, mask, fw, amount, texture) {
   const f1 = Math.max(0.6, fw * 0.004), f2 = Math.max(2, fw * 0.03), f3 = Math.max(6, fw * 0.12);
   const lo1 = blur3(y, f1).d, lo2 = blur3(y, f2).d, lo3 = blur3(y, f3).d;
   const ea = edgeAttn(ch(y, 0), mask, w, h, fw);
-  const a = amount, kl = [0.45 * a, 0.9 * a, 0.9 * a], km = [0.55 * a, 0.7 * a, 0.7 * a];
+  // PUM 1.1.2 (đo trên ảnh Capture One): da KHÔNG phẳng hơn về sáng tối mà MÀU da đều hơn -> chỉ giảm nhẹ sáng tối
+  // (EVEN_Y), loang MÀU (đỏ / vàng / xám từng mảng, lốm đốm nhỏ) thì san mạnh (EVEN_C); kết cấu chỉ ở kênh sáng tối
+  const a = amount;
+  const cl = Math.min(0.95, EVEN_C[0] * a), cm = Math.min(0.9, EVEN_C[1] * a), chh = Math.min(0.85, EVEN_C[2] * a);
+  const kl = [EVEN_Y[0] * a, cl, cl].map(f32), km = [EVEN_Y[1] * a, cm, cm].map(f32), kh = [0, chh, chh].map(f32);
+  const tex = [f32(texture * 0.8), 0, 0];
   const nw = { w, h, c: 3, d: new Float32Array(n * 3) };
   for (let i = 0; i < n; i++) {
     const k = mask[i] * ea[i];
     for (let c = 0; c < 3; c++) {
       const j = i * 3 + c, hf = y.d[j] - lo1[j], mid = lo1[j] - lo2[j], low = lo2[j] - lo3[j];
-      nw.d[j] = lo3[j] + low * (1 - k * kl[c]) + mid * (1 - k * km[c]) + hf * (1 + k * (texture * 0.8));
+      nw.d[j] = lo3[j] + low * (1 - k * kl[c]) + mid * (1 - k * km[c]) + hf * (1 + k * tex[c] - k * kh[c]);
     }
   }
   return rgb(nw);
 }
+const EVEN_Y = [0.12, 0.40];       // phần sáng tối bị san ở dải lớn (khối mặt) / dải vừa (mảng, nếp)
+const EVEN_C = [1.5, 1.3, 1.6];    // phần MÀU bị san ở dải lớn / vừa / rất nhỏ (lốm đốm, nhiễu màu trên da)
 
 // ---------------------------------------------------------------------------- từng khuôn mặt
 function processFace(out, lm, p, imp, prot, person, W, H, ox, oy) {
@@ -643,7 +803,7 @@ function processFace(out, lm, p, imp, prot, person, W, H, ox, oy) {
   if (b > 0) {
     const sk = maxFN(p.blemish_neck ?? true); for (let i = 0; i < n; i++) sk[i] *= eyesFar[i];
     const m = spotMask(ch(Yc, 0), ch(Yc, 1), sk, sw, sh, fw, b, false, skinlike);
-    reg = fillSpots(reg, m, fw, true, skinOk());
+    reg = fillSpots(reg, m, fw, true, skinOk(), null, true);
   }
   // 2) sợi tóc vương trên da
   const hi = (p.hair_inner || 0) / 100 * imp;
@@ -674,7 +834,7 @@ function processFace(out, lm, p, imp, prot, person, W, H, ox, oy) {
       }
       const km = new Uint8Array(n); for (let i = 0; i < n; i++) km[i] = keep[lab[i]];
       const fsk = new Uint8Array(n); for (let i = 0; i < n; i++) fsk[i] = faceSkin[i] > 0.5 ? 1 : 0;
-      reg = fillSpots(reg, dil(km, sw, sh, 1), fw, true, fsk);
+      reg = fillSpots(reg, dil(km, sw, sh, 1), fw, true, fsk, null, true);
     }
   }
   // 3) đều màu da

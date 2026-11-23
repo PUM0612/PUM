@@ -200,9 +200,50 @@ export function tiffInfo(buf) {
   return info;
 }
 
+// ISO của ảnh (library.read_iso của PUM máy tính): thẻ 0x8827 trong Exif IFD — RAW kiểu TIFF (ARW, NEF, DNG, CR2...)
+// hoặc JPEG (APP1 "Exif"). Không đọc được -> null.
+export function readIso(buf) {
+  try {
+    let base = 0;
+    if (buf[0] === 0xFF && buf[1] === 0xD8) {          // JPEG: tìm APP1 Exif
+      let p = 2;
+      base = -1;
+      while (p + 4 < buf.length && buf[p] === 0xFF) {
+        const mk = buf[p + 1], len = (buf[p + 2] << 8) | buf[p + 3];
+        if (mk === 0xE1 && buf[p + 4] === 0x45 && buf[p + 5] === 0x78 && buf[p + 6] === 0x69 && buf[p + 7] === 0x66) { base = p + 10; break; }
+        if (mk === 0xDA || len < 2) break;
+        p += 2 + len;
+      }
+      if (base < 0) return null;
+    }
+    const le = buf[base] === 0x49 && buf[base + 1] === 0x49, be = buf[base] === 0x4d && buf[base + 1] === 0x4d;
+    if (!le && !be) return null;
+    const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+    const u16 = (o) => dv.getUint16(base + o, le), u32 = (o) => dv.getUint32(base + o, le);
+    const ifd = (off) => {
+      const out = {};
+      if (base + off + 2 > buf.length) return out;
+      for (let i = 0, n = u16(off); i < n; i++) {
+        const p = off + 2 + 12 * i;
+        if (base + p + 12 > buf.length) break;
+        out[u16(p)] = [u16(p + 2), p + 8];
+      }
+      return out;
+    };
+    const top = ifd(u32(4));
+    if (!top[0x8769]) return null;
+    const ex = ifd(u32(top[0x8769][1]));
+    if (!ex[0x8827]) return null;
+    const [typ, p] = ex[0x8827];
+    const v = typ === 3 ? u16(p) : u32(p);
+    return v || null;
+  } catch (e) { return null; }
+}
+
 let LibRawMod = null;
 async function decodeRaw(blob) {
   const buf = new Uint8Array(await blob.arrayBuffer());
+  const iso = readIso(buf);
   // Ảnh RAW của iPhone (Apple ProRAW, .DNG): LibRaw bỏ qua độ phơi sáng gốc + đường cong tông / bản đồ sáng của Apple
   // nên ảnh ra tối gần một nửa (đo trên iPhone của người dùng: 70 so với 136 của app Ảnh). Cách làm, giống hệt
   // engine._decode_raw của PUM máy tính:
@@ -234,11 +275,11 @@ async function decodeRaw(blob) {
       const im = await raw.imageData();
       if (!im || !im.data) throw new Error('LibRaw không trả ảnh');
       const lut = ref && (im.bits || 16) > 8 ? matchLut(im.data, im.width, im.height, ref) : null;
-      return { src: new ArraySource(im.width, im.height, im.data, im.colors || 3, im.bits || 16, lut), raw: true, libraw: true, apple, appleLut: !!lut };
+      return { src: new ArraySource(im.width, im.height, im.data, im.colors || 3, im.bits || 16, lut), raw: true, libraw: true, apple, appleLut: !!lut, iso };
     } finally { raw.dispose(); }
   } catch (e) {
     console.warn('LibRaw lỗi, dùng ảnh xem trước nhúng:', e);
-    return { src: new BitmapSource(await rawEmbedded(buf)), rawPreview: true };
+    return { src: new BitmapSource(await rawEmbedded(buf)), rawPreview: true, iso };
   }
 }
 
@@ -257,7 +298,9 @@ export async function decodeQuick(blob, name) {
 export async function decodeFile(blob, name) {
   name = name || blob.name || '';
   if (isRawName(name)) return decodeRaw(blob);
-  try { return { src: new BitmapSource(await bitmapOf(blob)) }; } catch (e) {
+  let iso = null;
+  try { iso = readIso(new Uint8Array(await blob.slice(0, 1 << 18).arrayBuffer())); } catch (e) { iso = null; }
+  try { return { src: new BitmapSource(await bitmapOf(blob)), iso }; } catch (e) {
     if (/heic|heif/i.test(name + blob.type)) throw new Error('trình duyệt này không giải mã được HEIC (Safari trên iPhone giải mã được)');
     throw new Error('định dạng ảnh không hỗ trợ');
   }

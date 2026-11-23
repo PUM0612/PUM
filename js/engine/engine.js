@@ -4,6 +4,7 @@ import * as cv from './cv.js';
 import { BANDS, SKIN_HUE, mergeSettings, defaultSettings, cropRatio, lensActive, layerActive } from './settings.js';
 import { applyRetouch } from './retouch.js';
 import { layerMask } from './layers.js';
+import { faceSkinMask } from './portrait.js';
 
 const clip01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
 const smooth = (e0, e1, x) => { let t = (x - e0) / (e1 - e0); t = t < 0 ? 0 : t > 1 ? 1 : t; return t * t * (3 - 2 * t); };
@@ -122,15 +123,117 @@ export function resizeMax(im, maxSide) {
   return im;
 }
 
-export function autoWb(img) {
-  const small = resizeMax(img, 600);
-  const n = small.w * small.h, d = small.d;
-  const lab = new Float32Array(3);
-  const Ls = new Float32Array(n), chroma = new Float32Array(n);
-  for (let i = 0; i < n; i++) {
-    cv.rgb2lab(clip01(d[i * 3]), clip01(d[i * 3 + 1]), clip01(d[i * 3 + 2]), lab);
-    Ls[i] = lab[0]; chroma[i] = Math.hypot(lab[1], lab[2]);
+// làm tròn như round(x, nd) của Python: theo giá trị nhị phân thật, đúng nửa thì về số chẵn
+export function pyRound(x, nd = 0) {
+  if (!isFinite(x)) return x;
+  const s = Math.abs(x).toFixed(Math.min(100, nd + 30));
+  const [ip, fp = ''] = s.split('.');
+  let n = BigInt(ip + fp.slice(0, nd));
+  const rest = fp.slice(nd), first = rest[0] || '0', tie = first === '5' && /^0*$/.test(rest.slice(1));
+  if (first > '5' || (first === '5' && !tie) || (tie && n % 2n === 1n)) n += 1n;
+  const v = Number(n) / 10 ** nd;
+  return x < 0 ? -v : v;
+}
+
+// ---- PUM 1.1.2: cân bằng trắng như "Bảng điều khiển Capture One" — theo MÀU DA thật và MÀU TRẮNG trong ảnh
+export const WB_SKIN = [18.0, 11.0], WB_WHITE = [0.0, 2.0];   // đích (a*, b*): da hồng tự nhiên, trắng trung tính hơi ấm
+const WB_W = { white: [0.4, 2.0], skin: [0.1, 0.7] };          // trọng số (a*, b*)
+const WB_DAMP = 0.85;
+// từng mặt người: { med, fw, p97, rgb } — độ sáng trung vị / phân vị 97 và màu trung vị của da mặt (bầu mặt trừ mắt, mày, môi)
+function faceSkinPer(img, faces, wantRgb) {
+  const out = [];
+  if (!faces || !faces.length) return out;
+  const { w, h, d } = img, n = w * h;
+  const Y = new Float32Array(n);
+  for (let i = 0, j = 0; i < n; i++, j += 3) Y[i] = clip01(d[j]) * 0.2126 + clip01(d[j + 1]) * 0.7152 + clip01(d[j + 2]) * 0.0722;
+  for (const lm of faces) {
+    const fm = faceSkinMask(w, h, lm);
+    if (fm.fw < 20) continue;
+    const ys = [], rs = [], gs = [], bs = [];
+    for (let i = 0; i < n; i++) {
+      if (!fm.mask[i]) continue;
+      ys.push(Y[i]);
+      if (wantRgb) { rs.push(clip01(d[i * 3])); gs.push(clip01(d[i * 3 + 1])); bs.push(clip01(d[i * 3 + 2])); }
+    }
+    if (ys.length < 60) continue;
+    out.push({ med: F(cv.median(ys)), fw: fm.fw, p97: cv.percentile(ys, 97),
+      rgb: wantRgb ? [F(cv.median(rs)), F(cv.median(gs)), F(cv.median(bs))] : null });
   }
+  return out;
+}
+// engine.face_skin_rgb: màu trung vị da mặt người thật (bỏ mặt trên màn LED / poster rất sáng), hoặc null
+export function faceSkinRgb(img, faces) {
+  const per = faceSkinPer(img, faces, true);
+  if (!per.length) return null;
+  const real = per.filter((p) => p.med < 0.85).length ? per.filter((p) => p.med < 0.85) : per;
+  let ws = 0; const acc = [0, 0, 0];
+  for (const p of real) { const k = Math.sqrt(p.fw); ws += k; for (let c = 0; c < 3; c++) acc[c] += p.rgb[c] * k; }
+  return acc.map((v) => v / ws);
+}
+// engine.face_skin_stats: (trung vị, phân vị 97) độ sáng da mặt người thật, trọng số theo cỡ mặt; hoặc null
+export function faceSkinStats(img, faces) {
+  const per = faceSkinPer(img, faces, false);
+  if (!per.length) return null;
+  const real = per.filter((p) => p.med < 0.85).length ? per.filter((p) => p.med < 0.85) : per;
+  let ws = 0, a = 0, b = 0;
+  for (const p of real) { const k = Math.sqrt(p.fw); ws += k; a += p.med * k; b += p.p97 * k; }
+  return [a / ws, b / ws];
+}
+
+// engine.auto_wb(img, faces): có khuôn mặt / vùng trắng rõ thì tìm (temp, tint) đưa DA về màu tự nhiên và TRẮNG về
+// trung tính hơi ấm (ưu tiên chỉnh ít); không có cả hai thì thận trọng giữ màu máy ảnh ghi.
+export function autoWb(img, faces = null) {
+  const r = resizeMax(img, 600);
+  const sm = { w: r.w, h: r.h, c: 3, d: new Float32Array(r.d.length) };
+  for (let i = 0; i < r.d.length; i++) sm.d[i] = clip01(r.d[i]);
+  const n = sm.w * sm.h, d = sm.d;
+  const samples = [];
+  const skin = faces && faces.length ? faceSkinRgb(sm, faces) : null;
+  if (skin) samples.push([skin, WB_SKIN, WB_W.skin]);
+  const lab = new Float32Array(3), Ls = new Float32Array(n), chroma = new Float32Array(n);
+  const wr = [], wg = [], wb = [];
+  for (let i = 0, j = 0; i < n; i++, j += 3) {
+    cv.rgb2labCv(d[j], d[j + 1], d[j + 2], lab);
+    Ls[i] = lab[0]; chroma[i] = F(Math.hypot(lab[1], lab[2]));
+    if (lab[0] > 62 && lab[0] < 97 && Math.hypot(lab[1], lab[2]) < 11.0) { wr.push(d[j]); wg.push(d[j + 1]); wb.push(d[j + 2]); }
+  }
+  if (wr.length / n >= 0.015) samples.push([[F(cv.median(wr)), F(cv.median(wg)), F(cv.median(wb))], WB_WHITE, WB_W.white]);
+  if (samples.length) {
+    let best = Infinity, bT = 0, bTN = 0;
+    const rgb = new Float32Array(3);
+    for (let ti = 0; ti <= 56; ti++) {
+      const T = -56 + 2 * ti, t = T / 100;
+      for (let ni = 0; ni <= 40; ni++) {
+        const TN = -20 + ni, tn = TN / 100;
+        const m = [Math.exp(0.25 * t), Math.exp(-0.2 * tn), Math.exp(-0.25 * t)];
+        const den = m[0] * 0.2126 + m[1] * 0.7152 + m[2] * 0.0722;
+        m[0] /= den; m[1] /= den; m[2] /= den;
+        let err = 3 * (T / 50) ** 2 + 2 * (TN / 20) ** 2 + 0.1 * (TN * 0.6) ** 2;
+        for (const [src, [ta, tb], [wa, wbb]] of samples) {
+          for (let c = 0; c < 3; c++) rgb[c] = clip01(src[c] * m[c]);
+          cv.rgb2labCv(rgb[0], rgb[1], rgb[2], lab);
+          err += wa * (lab[1] - ta) ** 2 + wbb * (lab[2] - tb) ** 2;
+        }
+        if (err < best) { best = err; bT = T; bTN = TN; }
+      }
+    }
+    return [pyRound(bT * WB_DAMP, 1), pyRound(bTN * WB_DAMP, 1)];
+  }
+  // không có mặt người / vùng trắng: chỉ chỉnh khi đủ vùng THẬT SỰ trung tính (>= 3% ảnh), chỉnh nửa
+  let neuN = 0; const acc = [0, 0, 0];
+  for (let i = 0; i < n; i++) if (Ls[i] > 25 && Ls[i] < 95 && chroma[i] < 8.0) { neuN++; acc[0] += d[i * 3]; acc[1] += d[i * 3 + 1]; acc[2] += d[i * 3 + 2]; }
+  const share = neuN / n;
+  if (share >= 0.03) {
+    const [t, tn] = wbFromPixel(acc.map((v) => v / neuN));
+    const damp = Math.min(1, Math.max(0, (share - 0.03) / 0.12)) * 0.5;
+    return [Math.max(-30, Math.min(30, t * damp)), Math.max(-15, Math.min(15, tn * damp))];
+  }
+  const [t, tn] = autoWbLoose(sm, Ls, chroma);
+  return [Math.max(-10, Math.min(10, t * 0.25)), Math.max(-6, Math.min(6, tn * 0.25))];
+}
+// cách cũ: 1/4 điểm ít màu nhất (trừ quá tối / quá sáng) coi là trung tính (engine._auto_wb_loose)
+function autoWbLoose(small, Ls, chroma) {
+  const n = small.w * small.h, d = small.d;
   const okIdx = [];
   for (let i = 0; i < n; i++) if (Ls[i] > 22 && Ls[i] < 96) okIdx.push(i);
   const thr = okIdx.length ? Math.min(10, cv.percentile(okIdx.map((i) => chroma[i]), 25)) : 10;
@@ -141,7 +244,7 @@ export function autoWb(img) {
     damp = 0.35;
   }
   const mean = [0, 0, 0];
-  for (const i of keep) { mean[0] += clip01(d[i * 3]); mean[1] += clip01(d[i * 3 + 1]); mean[2] += clip01(d[i * 3 + 2]); }
+  for (const i of keep) { mean[0] += d[i * 3]; mean[1] += d[i * 3 + 1]; mean[2] += d[i * 3 + 2]; }
   for (let c = 0; c < 3; c++) mean[c] /= keep.length;
   const [t, tn] = wbFromPixel(mean);
   return [Math.max(-60, Math.min(60, t * damp)), Math.max(-40, Math.min(40, tn * damp))];
@@ -188,7 +291,46 @@ function calibrate(img, cal) {
   }
 }
 
-export function autoTone(img) {
+// engine.auto_tone (PUM 1.1.2, nút Tự động): phơi sáng học theo "Bảng điều khiển Capture One" — kéo sáng MỘT PHẦN theo độ
+// sáng da mặt và trung vị ảnh; Highlights "vai phim" khi ảnh có vùng sáng hơn trắng. img: ảnh đã cân bằng trắng + phơi
+// sáng, CHƯA cuộn vùng sáng (wbExpo); faces: điểm mốc khuôn mặt chuẩn hoá của chính ảnh đó.
+export const AUTO_EXPO = [-0.164, -0.223, -0.324, -0.343];   // hằng, log2(da mặt), log2(trung vị), có mặt
+export function autoTone(img, faces = null) {
+  const x0 = resizeMax(img, 800);
+  const x = { w: x0.w, h: x0.h, c: 3, d: new Float32Array(x0.d) };
+  rolloff(x, false);                     // phần phơi sáng: đo như lúc học (ảnh đã cuộn về 0..1)
+  const n = x.w * x.h, L = lum(x).d;
+  const med = cv.median(L);
+  const fs = faces && faces.length ? faceSkinStats(x, faces) : null;
+  const fl = fs ? fs[0] : null;
+  const [a0, af, am, ah] = AUTO_EXPO;
+  let exp;
+  if (fl !== null && fl > 0.03) {
+    exp = a0 + ah + af * Math.log2(fl) + am * Math.log2(Math.max(med, 1e-3));
+    exp = Math.min(exp, Math.log2(0.62 / fl));     // da mặt không sáng quá mức C1 hay để
+  } else exp = a0 + am * Math.log2(Math.max(med, 1e-3));
+  const p99 = cv.percentile(L, 99);
+  exp = Math.min(exp, Math.log2(1.8 / Math.max(p99, 0.05)));
+  // cảnh phần lớn là TRẮNG / xám sáng (váy cưới, phông trắng): C1 giữ tối cho vùng trắng còn chi tiết -> không nâng
+  let pale = 0;
+  for (let i = 0, j = 0; i < n; i++, j += 3) {
+    const r = x.d[j], g = x.d[j + 1], b = x.d[j + 2], mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+    if (L[i] > 0.6 && (mx - mn) < 0.15 * Math.max(mx, 1e-3) + 0.03) pale++;
+  }
+  if (pale / n > 0.2) exp = Math.min(exp, Math.log2(0.8 / Math.max(cv.percentile(L, 90), 0.05)));
+  exp = Math.min(2.2, Math.max(-1.5, exp));
+  // vùng sáng: "vai phim" như Capture One; ảnh không có gì sáng hơn trắng thì không nén
+  const k = 2 ** exp, n0 = x0.w * x0.h, N = new Float32Array(n0);
+  let over = 0;
+  for (let i = 0, j = 0; i < n0; i++, j += 3) { N[i] = F(hlNorm1(x0.d[j], x0.d[j + 1], x0.d[j + 2]) * k); if (N[i] > 1.0) over++; }
+  const fo = over / n0;
+  let hv = AUTO_HL / 100 * smooth(0.002, 0.02, fo);
+  if (fo > 0.002) hv = Math.max(hv, Math.min((cv.percentile(N, 99.8) - 1.0) / HL_RANGE, 0.9));
+  return { exposure: pyRound(exp, 2), highlights: -pyRound(100 * hv), shadows: 0, whites: 0, blacks: 0, tone_ver: 2 };
+}
+
+// engine.auto_tone_lr: cách Tự động cũ (kiểu Lightroom, không nhìn mặt người) — nút Auto của nhóm Tông
+export function autoToneLr(img) {
   const L = lum(resizeMax(img, 800)).d;
   const med = cv.median(L);
   const exp = Math.max(-2, Math.min(2, 0.75 * Math.log2(0.40 / Math.max(med, 1e-3))));
@@ -211,8 +353,9 @@ export function autoTone(img) {
 }
 
 // ---------------------------------------------------------------------------- _tone
-export function tone(img, s) {
-  const d = img.d, n = img.w * img.h, N = n * 3;
+// engine.wb_expo: cân bằng trắng + calibration + phơi sáng, CHƯA cuộn vùng sáng (sửa tại chỗ)
+export function wbExpo(img, s) {
+  const d = img.d, N = img.w * img.h * 3;
   const t = s.temp / 100, tn = s.tint / 100;
   if (t || tn) {
     const mul = [Math.exp(0.25 * t), Math.exp(-0.2 * tn), Math.exp(-0.25 * t)].map(Math.fround);
@@ -223,6 +366,11 @@ export function tone(img, s) {
   const cal = s.calib;
   if (cal && Object.values(cal).some((v) => Math.abs(v) > 1e-6)) calibrate(img, cal);
   if (s.exposure) { const k = Math.pow(2, s.exposure); for (let i = 0; i < N; i++) d[i] *= k; }
+  return img;
+}
+export function tone(img, s) {
+  const d = img.d, n = img.w * img.h, N = n * 3;
+  wbExpo(img, s);
   const refW = s._ref_w || img.w;
   const dz = s.dehaze / 100;
   if (dz > 0) {
@@ -239,31 +387,32 @@ export function tone(img, s) {
     for (let i = 0; i < N; i++) d[i] = d[i] + (0.75 - d[i]) * k;
   }
   const hl = s.highlights / 100, sh = s.shadows / 100;
+  const tv2 = (s.tone_ver ?? 1) >= 2;
   if (hl || sh) {
-    const L = cv.img1(img.w, img.h);
-    for (let i = 0, j = 0; i < n; i++, j += 3) {
-      const r = Math.min(4, Math.max(0, d[j])), g = Math.min(4, Math.max(0, d[j + 1])), b = Math.min(4, Math.max(0, d[j + 2]));
-      L.d[i] = r * 0.2126 + g * 0.7152 + b * 0.0722;
+    const vai = hl < 0 && tv2;            // Highlights âm của tone_ver 2 = vai phim (hlShoulder)
+    if (sh || !vai) {
+      const L = cv.img1(img.w, img.h);
+      for (let i = 0, j = 0; i < n; i++, j += 3) {
+        const r = Math.min(4, Math.max(0, d[j])), g = Math.min(4, Math.max(0, d[j + 1])), b = Math.min(4, Math.max(0, d[j + 2]));
+        L.d[i] = r * 0.2126 + g * 0.7152 + b * 0.0722;
+      }
+      const Bl = blur(L, refW * 0.012).d;
+      for (let i = 0, j = 0; i < n; i++, j += 3) {
+        const lb = Bl[i] * 0.6 + L.d[i] * 0.4;
+        let f = 1;
+        if (sh) { const m = Math.pow(1 - smooth(0, 0.55, lb), 2); f *= 1 + sh * 1.3 * m; }
+        if (hl && !vai) { f *= 1 + hl * 0.55 * smooth(0.45, 1.0, lb); }
+        d[j] *= f; d[j + 1] *= f; d[j + 2] *= f;
+      }
     }
-    const Bl = blur(L, refW * 0.012).d;
-    for (let i = 0, j = 0; i < n; i++, j += 3) {
-      const lb = Bl[i] * 0.6 + L.d[i] * 0.4;
-      let f = 1;
-      if (sh) { const m = Math.pow(1 - smooth(0, 0.55, lb), 2); f *= 1 + sh * 1.3 * m; }
-      if (hl) { f *= 1 + hl * 0.55 * smooth(0.45, 1.0, lb); }
-      d[j] *= f; d[j + 1] *= f; d[j + 2] *= f;
-    }
+    if (vai) hlShoulder(img, -hl, refW);
   }
   const wh = s.whites / 100, bl = s.blacks / 100;
   if (wh || bl) {
     const wp = 1 - wh * 0.3, bp = -bl * 0.08, den = Math.max(wp - bp, 0.05);
     for (let i = 0; i < N; i++) d[i] = (d[i] - bp) / den;
   }
-  for (let i = 0; i < N; i++) {
-    let v = d[i];
-    if (v > 0.9) v = 0.9 + 0.1 * Math.tanh((v - 0.9) / 0.1);
-    d[i] = v < 0 ? 0 : v > 1 ? 1 : v;
-  }
+  rolloff(img, tv2 && ROLL_KEEP);
   const c = s.contrast / 100;
   if (c) {
     if (c > 0) { const k = c * 1.4; for (let i = 0; i < N; i++) { const x = d[i]; d[i] = clip01(x + (x * x * (3 - 2 * x) - x) * k); } }
@@ -290,12 +439,15 @@ export function tone(img, s) {
     const l2 = curveLut(cvs[ch] || [[0, 0], [1, 1]]);
     if (l2) for (let i = ci; i < N; i += 3) d[i] = lutAt(l2, d[i]);
   });
+  const ll = curveLut(cvs.luma || [[0, 0], [1, 1]]);
+  if (ll) lumaCurve(img, ll);
   return img;
 }
 
 // ---------------------------------------------------------------------------- _color
 let _bandLuts = null;
 export function color(img, s) {
+  if ((s.color_ver ?? 1) >= 2) return color2(img, s);
   const col = s.color, skin = s.skin;
   const bandsOn = Object.values(col).some((v) => v.some((x) => Math.abs(x) > 1e-6));
   const skinOn = Object.values(skin).some((v) => Math.abs(v) > 1e-6);
@@ -378,6 +530,8 @@ export function color(img, s) {
       d[j] = L + (d[j] - L) * (1 + sat); d[j + 1] = L + (d[j + 1] - L) * (1 + sat); d[j + 2] = L + (d[j + 2] - L) * (1 + sat);
     }
   }
+  const dep = (s.depth || 0) / 100;
+  if (dep) depthV1(img, dep);              // ảnh chỉnh từ bản cũ vẫn dùng được thanh Độ sâu màu
   for (let i = 0; i < n * 3; i++) d[i] = clip01(d[i]);
   return img;
 }
@@ -485,6 +639,430 @@ export function colorAdv(img, ranges, show = null) {
       o[0] = g + (r0 - g) * w; o[1] = g + (g0 - g) * w; o[2] = g + (b0 - g) * w;
     }
     d[j] = clip01(o[0]); d[j + 1] = clip01(o[1]); d[j + 2] = clip01(o[2]);
+  }
+  return img;
+}
+
+// =====================================================================================================
+// PUM 1.1.2 (chép engine.py): kéo màu vào gam về phía đỉnh gam (oklab_to_rgb_fit), bộ máy màu OkLCh (_color2),
+// kênh Luma, Độ sâu màu, vai phim Highlights (tone_ver 2), cuộn vùng sáng giữ màu, Đỏ đầm (phim).
+// =====================================================================================================
+export const FIT_CUSP = 0.7;      // màu đậm + sáng vượt gam: kéo về phía đỉnh gam của sắc độ đó (sẫm lại, giữ độ đậm)
+const NLG = 97;
+let _CUSP = null, _CMAX = null;
+
+// engine._gamut_cusp: (độ sáng OkLab của đỉnh gam theo sắc độ 0..359 đã làm mượt, độ đậm lớn nhất trong gam theo
+// (sắc độ, L 0,02..0,98)) của gam RGB có ma trận LMS -> RGB tuyến tính mi. Tính bằng số thực 64 bit như numpy.
+function gamutCusp(mi, cmaxHi) {
+  const Ls = new Float64Array(NLG);
+  for (let i = 0; i < NLG; i++) Ls[i] = i * ((0.98 - 0.02) / 96) + 0.02;
+  Ls[NLG - 1] = 0.98;
+  const A = M_LAB_INV, lo = new Float32Array(360 * NLG), raw = new Float64Array(360);
+  for (let hh = 0; hh < 360; hh++) {
+    const th = hh * Math.PI / 180, ch = Math.cos(th), sh = Math.sin(th);
+    let best = -1, bi = 0;
+    for (let li = 0; li < NLG; li++) {
+      const L = Ls[li];
+      let l0 = 0, h0 = cmaxHi;
+      for (let it = 0; it < 16; it++) {
+        const C = (l0 + h0) * 0.5, a = C * ch, b = C * sh;
+        const x = Math.pow(L * A[0][0] + a * A[0][1] + b * A[0][2], 3);
+        const y = Math.pow(L * A[1][0] + a * A[1][1] + b * A[1][2], 3);
+        const z = Math.pow(L * A[2][0] + a * A[2][1] + b * A[2][2], 3);
+        const r = x * mi[0][0] + y * mi[0][1] + z * mi[0][2], g = x * mi[1][0] + y * mi[1][1] + z * mi[1][2];
+        const bb = x * mi[2][0] + y * mi[2][1] + z * mi[2][2];
+        if (Math.min(r, g, bb) >= -1e-6 && Math.max(r, g, bb) <= 1 + 1e-6) l0 = C; else h0 = C;
+      }
+      lo[hh * NLG + li] = l0;
+      if (l0 > best) { best = l0; bi = li; }
+    }
+    raw[hh] = Ls[bi];
+  }
+  const k = [1, 2, 3, 2, 1].map((v) => v / 9), cusp = new Float32Array(360);
+  for (let i = 0; i < 360; i++) {
+    let s = 0;
+    for (let j = 0; j < 5; j++) s += raw[(i + j - 2 + 360) % 360] * k[j];
+    cusp[i] = s;
+  }
+  return [cusp, lo];
+}
+export function cuspLut() {
+  if (!_CUSP) [_CUSP, _CMAX] = gamutCusp(M_LMS_INV, 0.45);
+  return _CUSP;
+}
+
+// OkLab -> LMS^3 -> RGB tuyến tính (mi), số thực 32 bit từng bước như numpy float32
+function linOf(L, a, b, mi, out) {
+  const A = M_LAB_INV;
+  let x = F(L * A[0][0] + a * A[0][1] + b * A[0][2]), y = F(L * A[1][0] + a * A[1][1] + b * A[1][2]);
+  let z = F(L * A[2][0] + a * A[2][1] + b * A[2][2]);
+  x = F(x * x * x); y = F(y * y * y); z = F(z * z * z);
+  out[0] = F(x * mi[0][0] + y * mi[0][1] + z * mi[0][2]);
+  out[1] = F(x * mi[1][0] + y * mi[1][1] + z * mi[1][2]);
+  out[2] = F(x * mi[2][0] + y * mi[2][1] + z * mi[2][2]);
+}
+const inGam = (o) => o[0] >= -1e-4 && o[1] >= -1e-4 && o[2] >= -1e-4 && o[0] <= 1 + 1e-4 && o[1] <= 1 + 1e-4 && o[2] <= 1 + 1e-4;
+// engine._oklab_fit_lin: OkLab -> RGB tuyến tính 0..1 của gam (mi, bảng đỉnh gam cusp), màu vượt gam kéo mềm về:
+// màu tối hơn đỉnh gam giảm bão hoà giữ độ sáng; màu sáng hơn đỉnh gam đi về phía đỉnh gam (sẫm lại, giữ độ đậm)
+export function fitLin(L, a, b, mi, cusp, out) {
+  L = L < 0 ? 0 : L > 1 ? 1 : L;
+  linOf(L, a, b, mi, out);
+  if (!inGam(out)) {
+    let L0 = L;
+    if (FIT_CUSP > 0) {
+      const hi = Math.trunc(F(pmod(F(Math.atan2(b, a) * 180 / Math.PI), 360))) % 360;
+      L0 = F(L - FIT_CUSP * Math.max(F(L - cusp[hi]), 0));
+    }
+    const dL = F(L - L0);
+    let lo = 0, hi = 1;
+    for (let it = 0; it < 8; it++) {                  // chia đôi tìm điểm xa nhất trên đường về (L0, xám) còn trong gam
+      const t = F((lo + hi) * 0.5);
+      linOf(F(L0 + F(dL * t)), F(a * t), F(b * t), mi, out);
+      if (inGam(out)) lo = t; else hi = t;
+    }
+    linOf(F(L0 + F(dL * lo)), F(a * lo), F(b * lo), mi, out);
+  }
+  for (let c = 0; c < 3; c++) out[c] = out[c] < 0 ? 0 : out[c] > 1 ? 1 : out[c];
+}
+const _fit = new Float32Array(3);
+// engine.oklab_to_rgb_fit cho một điểm (ghi sRGB 0..1 vào out)
+export function okFit1(L, a, b, lutOut, out) {
+  fitLin(L, a, b, M_LMS_INV, cuspLut(), _fit);
+  out[0] = lutAt(lutOut, _fit[0]); out[1] = lutAt(lutOut, _fit[1]); out[2] = lutAt(lutOut, _fit[2]);
+}
+
+// engine._hue_eq_lut: sắc độ OkLab (0,25 độ / ô) -> sắc độ HSV tương đương (tâm 8 dải màu / màu da giữ nghĩa cũ)
+let _HUE_EQ = null;
+function hueEqLut() {
+  if (_HUE_EQ) return _HUE_EQ;
+  const n = 1440, ok = new Float32Array(n), hs = new Float32Array(n), t = new Float32Array(3), lab = new Float32Array(3);
+  const lutIn = srgbLuts()[0];
+  for (let i = 0; i < n; i++) {
+    hs[i] = F(i * 0.25);
+    cv.hsv2rgb(hs[i], F(0.75), F(0.85), t);
+    okLab1(t[0], t[1], t[2], lutIn, lab);
+    ok[i] = F(pmod(F(Math.atan2(lab[2], lab[1]) * 180 / Math.PI), 360));
+  }
+  const o = Array.from({ length: n }, (_, i) => i).sort((p, q) => ok[p] - ok[q]);
+  const xs = new Float64Array(n + 2), p = new Float64Array(n + 2);
+  xs[0] = F(ok[o[n - 1]] - 360); xs[n + 1] = F(ok[o[0]] + 360);
+  p[0] = F(hs[o[n - 1]] * Math.PI / 180); p[n + 1] = F(hs[o[0]] * Math.PI / 180);
+  for (let i = 0; i < n; i++) { xs[i + 1] = ok[o[i]]; p[i + 1] = F(hs[o[i]] * Math.PI / 180); }
+  const ys = new Float64Array(n + 2);                       // np.unwrap
+  ys[0] = p[0];
+  let corr = 0;
+  for (let i = 1; i < n + 2; i++) {
+    const dd = p[i] - p[i - 1];
+    let ddm = pmod(dd + Math.PI, 2 * Math.PI) - Math.PI;
+    if (ddm === -Math.PI && dd > 0) ddm = Math.PI;
+    let pc = ddm - dd;
+    if (Math.abs(dd) < Math.PI) pc = 0;
+    corr += pc;
+    ys[i] = p[i] + corr;
+  }
+  _HUE_EQ = new Float32Array(n);
+  for (let i = 0; i < n; i++) {                              // np.interp
+    const q = i / 4;
+    let a = 0, b = n + 1;
+    while (b - a > 1) { const m = (a + b) >> 1; if (xs[m] <= q) a = m; else b = m; }
+    const v = xs[b] === xs[a] ? ys[a] : ys[a] + (ys[b] - ys[a]) * (q - xs[a]) / (xs[b] - xs[a]);
+    _HUE_EQ[i] = pmod(v * 180 / Math.PI, 360);
+  }
+  return _HUE_EQ;
+}
+
+export const DEPTH_L = 0.30, DEPTH_C = 0.14;     // Độ sâu màu 100: màu rất đậm sẫm đi 30%, đậm thêm 14%
+export const BAND_L = 0.30;                      // Độ sáng dải màu +-100: màu đậm sáng lên / sẫm đi tới ~1/2
+const hueD32 = (H, c) => F(F(pmod(F(F(H - c) + 180), 360)) - 180);
+
+// engine._color2_1: chỉnh màu trong OkLCh (như Color Editor của Capture One)
+function color2(img, s) {
+  const col = s.color, skin = s.skin;
+  const bandsOn = Object.values(col).some((v) => v.some((x) => Math.abs(x) > 1e-6));
+  const skinOn = Object.values(skin).some((v) => Math.abs(v) > 1e-6);
+  const vib = s.vibrance / 100, sat = s.saturation / 100, dep = (s.depth || 0) / 100;
+  const d = img.d, n = img.w * img.h;
+  if (bandsOn || skinOn || vib || sat || dep) {
+    const [lutIn, lutOut] = srgbLuts();
+    const heq = hueEqLut();
+    const Lr = new Float32Array(n), Cr = new Float32Array(n), Hr = new Float32Array(n);
+    const t = new Float32Array(3);
+    for (let i = 0, j = 0; i < n; i++, j += 3) {
+      okLab1(d[j], d[j + 1], d[j + 2], lutIn, t);
+      Lr[i] = t[0]; Cr[i] = Math.sqrt(t[1] * t[1] + t[2] * t[2]);
+      Hr[i] = pmod(F(Math.atan2(t[2], t[1]) * 180 / Math.PI), 360);
+    }
+    const hix = (h) => { const k = Math.trunc(F(h * 4)); return k < 0 ? 0 : k > 1439 ? 1439 : k; };
+    if (bandsOn) {
+      const den = new Float32Array(1440), lh = new Float32Array(1440), ls = new Float32Array(1440), ll = new Float32Array(1440);
+      for (const [key, , center] of BANDS) {
+        const [hs_, ss_, ls_] = col[key];
+        for (let q = 0; q < 1440; q++) {
+          const w = F(Math.exp(-Math.pow(hueD32(heq[q], center) / 22, 2)));
+          den[q] += w; lh[q] += F(w * hs_); ls[q] += F(w * ss_); ll[q] += F(w * ls_);
+        }
+      }
+      for (let q = 0; q < 1440; q++) {
+        const dd = Math.max(den[q], 1e-6);
+        lh[q] = lh[q] / dd; ls[q] = ls[q] / dd; ll[q] = ll[q] / dd;
+      }
+      for (let i = 0; i < n; i++) {
+        const k = hix(Hr[i]), ch = smooth(0.008, 0.05, Cr[i]);
+        const nh = F(lh[k] * ch), ns = F(ls[k] * ch), nl = F(ll[k] * ch);
+        Hr[i] = pmod(F(Hr[i] + nh * 0.3), 360);
+        Cr[i] = Cr[i] * Math.min(3, Math.max(0, 1 + ns / 100));
+        const C = Cr[i];
+        const dl = (nl / 100) * BAND_L * Math.min(1, Math.max(0.25, C / 0.065));
+        const L = Lr[i];
+        Lr[i] = clip01(L + dl * (dl > 0 ? 1 - L : L) * 1.6);
+      }
+    }
+    let SW = null;
+    if (skinOn || vib) {
+      const swH = new Float32Array(1440);
+      for (let q = 0; q < 1440; q++) swH[q] = F(Math.exp(-Math.pow(hueD32(heq[q], SKIN_HUE) / 18, 2)));
+      SW = new Float32Array(n);
+      for (let i = 0; i < n; i++) {
+        const C = Cr[i];
+        SW[i] = swH[hix(Hr[i])] * smooth(0.012, 0.035, C) * (1 - smooth(0.14, 0.2, C)) * smooth(0.2, 0.38, Lr[i]);
+      }
+    }
+    if (skinOn) {
+      let hc, sc;
+      if (s._skin_stats) [hc, sc] = s._skin_stats;
+      else if (!skin.uni_hue && !skin.uni_sat && !s._skin_stats_out) { hc = 50.0; sc = 0.06; }   // tâm màu da chỉ cần cho Đều sắc độ / bão hoà
+      else {
+        let tot = 0, ssn = 0, scs = 0, scc = 0;
+        for (let i = 0; i < n; i++) {
+          const w = SW[i];
+          if (!w) continue;
+          const ang = F(Hr[i] * Math.PI / 180);
+          tot += w; ssn += w * Math.sin(ang); scs += w * Math.cos(ang); scc += w * Cr[i];
+        }
+        if (tot > 1) { hc = pmod(Math.atan2(ssn, scs) * 180 / Math.PI, 360); sc = scc / tot; } else { hc = 50.0; sc = 0.06; }
+        if (s._skin_stats_out) s._skin_stats_out.push([hc, sc]);
+      }
+      if (skin.uni_hue) { const k = skin.uni_hue / 100; for (let i = 0; i < n; i++) Hr[i] = pmod(Hr[i] + hueDist(hc, Hr[i]) * k * SW[i], 360); }
+      if (skin.uni_sat) { const k = skin.uni_sat / 100; for (let i = 0; i < n; i++) Cr[i] = Cr[i] + (sc - Cr[i]) * k * SW[i]; }
+      if (skin.uni_lum) {
+        const w = s._ref_w || img.w;
+        const Li = cv.img1(img.w, img.h, Lr);
+        const a = blur(Li, Math.max(0.8, w * 0.002)).d, b = blur(Li, w * 0.02).d;
+        const k = skin.uni_lum / 100;
+        for (let i = 0; i < n; i++) Lr[i] = Lr[i] - (a[i] - b[i]) * k * SW[i];
+      }
+      if (skin.hue) for (let i = 0; i < n; i++) Hr[i] = pmod(Hr[i] + skin.hue * 0.2 * SW[i], 360);
+      if (skin.sat) for (let i = 0; i < n; i++) Cr[i] = Cr[i] * (1 + skin.sat / 100 * SW[i]);
+      if (skin.lum) for (let i = 0; i < n; i++) Lr[i] = Lr[i] * (1 + skin.lum / 100 * 0.25 * SW[i]);
+    }
+    if (vib) {
+      for (let i = 0; i < n; i++) {
+        const cn = Math.min(1, Math.max(0, Cr[i] / 0.2));
+        Cr[i] = vib > 0 ? Cr[i] * (1 + vib * (1 - cn) * (1 - 0.6 * SW[i])) : Cr[i] * (1 + vib * (1 - cn * 0.5));
+      }
+    }
+    if (sat) { const k = Math.max(0, 1 + sat); for (let i = 0; i < n; i++) Cr[i] = Cr[i] * k; }
+    if (dep) {
+      for (let i = 0; i < n; i++) {
+        const cn = Math.pow(Math.min(1, Math.max(0, (Cr[i] - 0.012) / 0.168)), 0.8);   // gần xám: không đổi
+        Lr[i] = Lr[i] * (1 - DEPTH_L * dep * cn);
+        Cr[i] = Cr[i] * (1 + DEPTH_C * dep);
+      }
+    }
+    for (let i = 0, j = 0; i < n; i++, j += 3) {
+      const th = F(Hr[i] * Math.PI / 180), C = Cr[i];
+      okFit1(clip01(Lr[i]), F(C * Math.cos(th)), F(C * Math.sin(th)), lutOut, t);
+      d[j] = t[0]; d[j + 1] = t[1]; d[j + 2] = t[2];
+    }
+  }
+  if ((s.color_adv && s.color_adv.length) || (s._cadv_show !== undefined && s._cadv_show !== null))
+    colorAdv(img, s.color_adv || [], s._cadv_show ?? null);
+  for (let i = 0; i < n * 3; i++) d[i] = clip01(d[i]);
+  return img;
+}
+
+// Độ sâu màu cho ảnh dựng màu kiểu cũ (color_ver 1)
+function depthV1(img, dep) {
+  const [lutIn, lutOut] = srgbLuts(), d = img.d, n = img.w * img.h, t = new Float32Array(3), k = 1 + DEPTH_C * dep;
+  for (let i = 0, j = 0; i < n; i++, j += 3) {
+    okLab1(d[j], d[j + 1], d[j + 2], lutIn, t);
+    const C = Math.sqrt(t[1] * t[1] + t[2] * t[2]);
+    const cn = Math.pow(Math.min(1, Math.max(0, (C - 0.012) / 0.168)), 0.8);
+    okFit1(F(t[0] * (1 - DEPTH_L * dep * cn)), F(t[1] * k), F(t[2] * k), lutOut, t);
+    d[j] = t[0]; d[j + 1] = t[1]; d[j + 2] = t[2];
+  }
+}
+
+// ---- kênh đường cong Luma (engine._luma_curve): chỉ đổi OkLab L, độ đậm màu đổi theo (L mới / L cũ)^0,9
+export const LUMA_SAT_KEEP = 0.9;
+function lumaCurve(img, lut) {
+  const [lutIn, lutOut] = srgbLuts(), d = img.d, n = img.w * img.h, t = new Float32Array(3);
+  for (let i = 0, j = 0; i < n; i++, j += 3) {
+    okLab1(d[j], d[j + 1], d[j + 2], lutIn, t);
+    const L = t[0], L2 = lutAt(lut, clip01(L));
+    const k = F(Math.pow(Math.min(4, Math.max(0.25, F(F(L2 + 1e-3) / F(L + 1e-3)))), LUMA_SAT_KEEP));
+    okFit1(L2, F(t[1] * k), F(t[2] * k), lutOut, t);
+    d[j] = t[0]; d[j + 1] = t[1]; d[j + 2] = t[2];
+  }
+}
+
+// ---- vai phim cho thanh Highlights âm (tone_ver 2) — engine._hl_shoulder và các hàm đi kèm
+export const HL_KNEE = 0.9, HL_KNEE_H = 0.35, HL_RANGE = 2.5, HL_MAXMIX = 0.5;
+const HL_LOCAL_MAX = true;
+export const HL_PALE_AMT = 0.2, HL_PALE_SAT = [0.05, 0.22], HL_PALE_N = [1.2, 2.0];
+export const AUTO_HL = 45.0;
+export const ROLL_KEEP = true, ROLL_SAT = [0.3, 0.7];
+function hlA(h) {
+  const k = HL_KNEE - HL_KNEE_H * h, nn = (1.0 + HL_RANGE * h - k) / (1.0 - k);
+  let a = 1.0;
+  for (let i = 0; i < 200; i++) a = Math.log(1.0 + a * nn);
+  return a;
+}
+function hlCurve1(N, k, a) {           // engine._hl_curve cho một giá trị (a, k tính sẵn)
+  if (a < 1e-3 || !(N > k)) return N;
+  const u = F(Math.max(F(N - k), 0) / (1.0 - k));
+  return F(k + (1.0 - k) * F(Math.log1p(F(a * u))) / a);
+}
+function hlOut1(x, k, a) {             // engine._hl_out
+  const S = hlCurve1(x, k, a);
+  if (!(S > 0.9)) return S;
+  const v = Math.min(0.9995, Math.max(0, F((S - 0.9) / 0.1)));
+  return F(0.9 + 0.1 * Math.atanh(v));
+}
+export function hlNorm1(r, g, b) {     // engine._hl_norm
+  r = r < 0 ? 0 : r > 4 ? 4 : r; g = g < 0 ? 0 : g > 4 ? 4 : g; b = b < 0 ? 0 : b > 4 ? 4 : b;
+  const L = F(F(F(r * 0.2126) + F(g * 0.7152)) + F(b * 0.0722));
+  return HL_MAXMIX ? F(F(L * (1.0 - HL_MAXMIX)) + F(Math.max(r, g, b) * HL_MAXMIX)) : L;
+}
+// h = -Highlights / 100 (> 0), w = bề rộng tham chiếu cả ảnh
+function hlShoulder(img, h, w) {
+  const d = img.d, n = img.w * img.h;
+  const N = cv.img1(img.w, img.h);
+  for (let i = 0, j = 0; i < n; i++, j += 3) N.d[i] = hlNorm1(d[j], d[j + 1], d[j + 2]);
+  const Bl = blur(N, w * 0.012).d;
+  const k = HL_KNEE - HL_KNEE_H * h, a = hlA(h);
+  const kf = F(k);
+  for (let i = 0, j = 0; i < n; i++, j += 3) {
+    const Ni = N.d[i];
+    let nb = F(F(Bl[i] * 0.6) + F(Ni * 0.4));
+    if (HL_LOCAL_MAX && Ni > nb) nb = Ni;
+    if (!(nb > kf)) continue;
+    const r = d[j], g = d[j + 1], b = d[j + 2];
+    const pr = r < 0 ? 0 : r > 4 ? 4 : r, pg = g < 0 ? 0 : g > 4 ? 4 : g, pb = b < 0 ? 0 : b > 4 ? 4 : b;
+    const fhp = F(hlOut1(nb, k, a) / nb);
+    const rr = F(nb / Math.max(Ni, 1e-4));
+    const qr = F(pr * rr), qg = F(pg * rr), qb = F(pb * rr);
+    const fr = F(hlOut1(qr, k, a) / Math.max(qr, 1e-4)), fg = F(hlOut1(qg, k, a) / Math.max(qg, 1e-4));
+    const fb = F(hlOut1(qb, k, a) / Math.max(qb, 1e-4));
+    const satr = 1.0 - Math.min(pr, pg, pb) / Math.max(Math.max(pr, pg, pb), 1e-4);
+    let keep = smooth(ROLL_SAT[0], ROLL_SAT[1], satr);
+    if (HL_PALE_AMT > 0) {
+      const pale = HL_PALE_AMT * smooth(HL_PALE_SAT[0], HL_PALE_SAT[1], satr) * (1.0 - smooth(HL_PALE_N[0], HL_PALE_N[1], Ni));
+      keep = Math.max(keep, pale);
+    }
+    d[j] = r * (fr + (fhp - fr) * keep);
+    d[j + 1] = g * (fg + (fhp - fg) * keep);
+    d[j + 2] = b * (fb + (fhp - fb) * keep);
+  }
+}
+// engine._rolloff: cuộn vùng sáng mềm 0,9.. -> 0,9..1 rồi cắt 0..1; keep (tone_ver 2): màu ĐẬM hạ cả 3 kênh cùng tỉ lệ
+function rolloff(img, keep) {
+  const d = img.d, N = d.length;
+  const tn = (v) => F(0.9 + 0.1 * Math.tanh(F((v - 0.9) / 0.1)));
+  for (let j = 0; j < N; j += 3) {
+    const r = d[j], g = d[j + 1], b = d[j + 2];
+    if (r > 0.9 || g > 0.9 || b > 0.9) {
+      let r2 = r > 0.9 ? tn(r) : r, g2 = g > 0.9 ? tn(g) : g, b2 = b > 0.9 ? tn(b) : b;
+      if (keep) {
+        const m = Math.max(r, g, b);
+        const w = smooth(ROLL_SAT[0], ROLL_SAT[1], 1.0 - Math.max(Math.min(r, g, b), 0.0) / m);
+        const f = F(tn(m) / m);
+        r2 = F(r2 + (F(r * f) - r2) * w); g2 = F(g2 + (F(g * f) - g2) * w); b2 = F(b2 + (F(b * f) - b2) * w);
+      }
+      d[j] = clip01(r2); d[j + 1] = clip01(g2); d[j + 2] = clip01(b2);
+    } else { d[j] = clip01(r); d[j + 1] = clip01(g); d[j + 2] = clip01(b); }
+  }
+}
+
+// ---- "Đỏ đầm (phim)" (film_color): vai màu cho đỏ đậm sáng (engine._color_shoulder) + xoay về đỏ son (_red_film_hue)
+export const COLOR_SH = [0.72, 0.85], COLOR_SH_C = [0.09, 0.15], COLOR_SH_L = 0.04, COLOR_SH_H = [35.0, 60.0, 20.0];
+export const COLOR_SH_ROT = 8.5, COLOR_SH_ROT_L = [0.42, 0.68];
+function colorShoulder(img, k, refW) {
+  const d = img.d, w = img.w, h = img.h, n = w * h;
+  const [lutIn, lutOut] = srgbLuts();
+  const cusp = cuspLut(), CM = _CMAX;
+  const t = new Float32Array(3);
+  let nc0 = 0;                                       // đếm trước số điểm ứng viên -> mảng cố định (nhanh hơn mảng động)
+  for (let j = 0; j < n * 3; j += 3) {
+    const r = d[j], g = d[j + 1], b = d[j + 2], mx = Math.max(r, g, b);
+    if (mx > 0.6 && Math.min(r, g, b) < 0.62 * mx) nc0++;
+  }
+  if (!nc0) return img;
+  const idxs = new Int32Array(nc0), Ls = new Float32Array(nc0), As = new Float32Array(nc0), Bs = new Float32Array(nc0);
+  const Ms = new Float64Array(nc0), Ds = new Float64Array(nc0);
+  let np = 0;
+  for (let i = 0, j = 0; i < n; i++, j += 3) {
+    const r = d[j], g = d[j + 1], b = d[j + 2], mx = Math.max(r, g, b);
+    if (!(mx > 0.6 && Math.min(r, g, b) < 0.62 * mx)) continue;
+    okLab1(r, g, b, lutIn, t);
+    const L = t[0], C = F(Math.sqrt(t[1] * t[1] + t[2] * t[2]));
+    const hi = Math.trunc(F(pmod(F(Math.atan2(t[2], t[1]) * 180 / Math.PI), 360))) % 360;
+    const Lc = cusp[hi];
+    const hue_w = 1.0 - smooth(COLOR_SH_H[0], COLOR_SH_H[1], Math.abs(pmod(hi - COLOR_SH_H[2] + 180.0, 360) - 180.0));
+    if (!(hue_w > 0 && C > COLOR_SH_C[0] && L > Lc - COLOR_SH_L)) continue;
+    const li = Math.min(95.999, Math.max(0, (L - 0.02) / 0.01)), i0 = Math.trunc(li), f = li - i0;
+    const cmax = CM[hi * NLG + i0] * (1 - f) + CM[hi * NLG + i0 + 1] * f;
+    const m = smooth(COLOR_SH[0], 1.0, C / Math.max(cmax, 1e-3)) * smooth(COLOR_SH_C[0], COLOR_SH_C[1], C) * hue_w *
+      smooth(-COLOR_SH_L, COLOR_SH_L, L - Lc);
+    idxs[np] = i; Ls[np] = L; As[np] = t[1]; Bs[np] = t[2]; Ms[np] = m; Ds[np] = Math.max(L - Lc, 0.0) * m; np++;
+  }
+  if (!np) return img;
+  // trung bình trong vùng (lưới thưa + làm mờ) -> mọi điểm của mảng hạ cùng một mức (giữ nếp vải)
+  const q = Math.max(1, cv.roundEven((refW || w) / 600.0));
+  const gh = Math.trunc(h / q) + 1, gw = Math.trunc(w / q) + 1;
+  const Dg = new Float64Array(gh * gw), Mg = new Float64Array(gh * gw), cell = new Int32Array(np);
+  for (let p = 0; p < np; p++) {
+    const i = idxs[p], y = Math.trunc(i / w), x = i - y * w;
+    const c = Math.trunc(y / q) * gw + Math.trunc(x / q);
+    cell[p] = c; Dg[c] += Ds[p]; Mg[c] += Ms[p];
+  }
+  const sig = Math.max(1.0, (refW || w) * 0.006 / q);
+  const Db = cv.gaussianBlur(cv.img1(gw, gh, Float32Array.from(Dg)), sig).d;
+  const Mb = cv.gaussianBlur(cv.img1(gw, gh, Float32Array.from(Mg)), sig).d;
+  const kk = k === null || k === undefined ? COLOR_SH[1] : k;
+  for (let p = 0; p < np; p++) {
+    const c = cell[p];
+    const drop = F(F(Db[c] / Math.max(Mb[c], 1e-4)) * Ms[p] * kk);
+    if (!(drop > 1e-4)) continue;
+    okFit1(F(Ls[p] - drop), As[p], Bs[p], lutOut, t);
+    const j = idxs[p] * 3;
+    d[j] = t[0]; d[j + 1] = t[1]; d[j + 2] = t[2];
+  }
+  return img;
+}
+function redFilmHue(img, k) {
+  const d = img.d, n = img.w * img.h;
+  const [lutIn, lutOut] = srgbLuts();
+  const t = new Float32Array(3);
+  for (let i = 0, j = 0; i < n; i++, j += 3) {
+    const r = d[j], g = d[j + 1], b = d[j + 2], mx = Math.max(r, g, b);
+    if (!(mx > 0.35 && Math.min(r, g, b) < 0.7 * mx)) continue;
+    okLab1(r, g, b, lutIn, t);
+    const L = t[0], a = t[1], bb = t[2], C = F(Math.sqrt(a * a + bb * bb));
+    const hd = F(pmod(F(Math.atan2(bb, a) * 180 / Math.PI), 360));
+    const hue_w = 1.0 - smooth(COLOR_SH_H[0], COLOR_SH_H[1], Math.abs(pmod(hd - COLOR_SH_H[2] + 180.0, 360) - 180.0));
+    const w = hue_w * smooth(COLOR_SH_C[0], COLOR_SH_C[1], C) * smooth(COLOR_SH_ROT_L[0], COLOR_SH_ROT_L[1], L);
+    if (!(w > 1e-3)) continue;
+    const th = -COLOR_SH_ROT * k * w * Math.PI / 180, ca = Math.cos(th), sa = Math.sin(th);
+    okFit1(L, F(a * ca - bb * sa), F(a * sa + bb * ca), lutOut, t);
+    d[j] = t[0]; d[j + 1] = t[1]; d[j + 2] = t[2];
+  }
+  return img;
+}
+export function filmColor(img, s) {
+  if ((s.film_color || 0) > 0) {
+    colorShoulder(img, s.film_color / 100, s._ref_w);
+    redFilmHue(img, s.film_color / 100);
   }
   return img;
 }
@@ -1035,6 +1613,7 @@ export function applyLayers(img, s, ctx) {
     const ls = defaultSettings();
     for (const [k, v] of Object.entries(ly.adj)) ls[k] = v;
     ls._ref_w = refW;
+    ls.tone_ver = 1;                    // layer chỉnh trên ảnh đã dựng (0..1): Highlights kiểu kéo vùng sáng xuống
     let adj = tone(cv.clone(img), ls);
     if (ls.saturation) adj = color(adj, ls);
     adj = texture(adj, ls.texture, refW);
@@ -1054,6 +1633,7 @@ export function adjustA(img, s, ctx) {
   img = vigCorr(img, s, roi);
   img = tone(img, s);
   img = color(img, s);
+  img = filmColor(img, s);
   img = grading(img, s.grading);
   return applyLayers(img, s, ctx);
 }
@@ -1091,6 +1671,7 @@ export function roiMargin(s, W, stage) {
       if ((d.dehaze || 0) > 0) sig = Math.max(sig, 0.02 * W);
       if (d.highlights || d.shadows) sig = Math.max(sig, 0.012 * W);
       if (d.clarity) sig = Math.max(sig, 0.01 * W);
+      if (d.film_color) sig = Math.max(sig, 0.007 * W);
       if (d.texture) sig = Math.max(sig, 0.0015 * W);
     }
     if (s.skin && s.skin.uni_lum) sig = Math.max(sig, 0.02 * W);

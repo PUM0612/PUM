@@ -91,7 +91,7 @@ export class Panels {
     this.W({ sync: () => this.drawStyleGrid() });
     this.page('s_auto',
       big('✨ Tự động chỉnh ảnh', () => app.autoAll()),
-      h('div', { class: 'hint' }, 'Tự cân màu, sáng tối và độ trong — chỉnh thêm ở các tab bên cạnh nếu muốn.'),
+      h('div', { class: 'hint' }, 'Cân màu theo da / màu trắng và chỉnh sáng tối như "Bảng điều khiển Capture One" (ảnh ISO cao tự khử nhiễu). Muốn màu giống Capture One: chọn thêm style "Gu Capture One (Cơ bản)".'),
       h('div', { class: 'stitle' }, 'Style'), this.styleGrid, strength.el,
       h('div', { class: 'grid2', style: 'margin-top:8px' }, btn('↺ Bỏ mọi chỉnh sửa', () => app.resetAll()), btn('Sao chép / dán…', () => this.setMode('full'))),
       more());
@@ -111,9 +111,11 @@ export class Panels {
       this.S('Sắc thái', ['tint'], -100, 100, { gradient: ['#3dbb4a', '#cccccc', '#c94fc4'] }),
       this.S('Độ tươi màu', ['vibrance'], -100, 100, { gradient: ['#777777', '#a98bb8', '#d7508e'] }),
       this.S('Bão hoà', ['saturation'], -100, 100, { gradient: ['#777777', '#cf9a52', '#e2403a'] }),
+      this.S('Độ sâu màu', ['depth'], -100, 100, { gradient: ['#e8c9c9', '#c0605a', '#6e1410'] }),
+      this.S('Đỏ đầm (phim)', ['film_color'], 0, 100, { gradient: ['#f08a80', '#c2302a', '#7a0f0c'] }),
       multi('Da đều màu', [['skin', 'uni_hue'], 1], [[['skin', 'uni_hue'], 1], [['skin', 'uni_sat'], 0.7], [['skin', 'uni_lum'], 0.4]]),
       h('div', { class: 'grid3' }, btn('Tự động màu', () => app.auto('color')), btn('💧 Chấm điểm trắng', () => app.setTool(app.tool === 'wb' ? null : 'wb')),
-        btn('↺ Đặt lại', () => app.resetPaths([['temp'], ['tint'], ['vibrance'], ['saturation'], ['skin']]))),
+        btn('↺ Đặt lại', () => app.resetPaths([['temp'], ['tint'], ['vibrance'], ['saturation'], ['depth'], ['film_color'], ['skin']]))),
       more());
     // ---- Hiệu ứng
     this.page('s_effect',
@@ -288,11 +290,16 @@ export class Panels {
     wb.el.append(btn('💧', () => app.setTool(app.tool === 'wb' ? null : 'wb'), 'pick-wb'));
     this.W(wb);
     this.page('basic',
-      this.sec('Màu (Color)', { auto: auto('color'), reset: reset(['temp'], ['tint'], ['vibrance'], ['saturation']) }).add(wb,
+      // nút Tự động của PUM 1.1.2: phơi sáng theo da mặt + vùng sáng "vai phim" như bảng Capture One (khử nhiễu khi ISO cao)
+      h('div', { class: 'grid2' }, btn('✨ Tự động (như Capture One)', () => app.auto('c1')), btn('Cân màu + Tự động', () => app.autoAll())),
+      this.sec('Màu (Color)', { auto: auto('color'), reset: reset(['temp'], ['tint'], ['vibrance'], ['saturation'], ['depth'], ['film_color']) }).add(wb,
         this.S('Nhiệt độ', ['temp'], -100, 100, { gradient: ['#3d6fd9', '#cccccc', '#e3b23c'] }),
         this.S('Sắc thái (Tint)', ['tint'], -100, 100, { gradient: ['#3dbb4a', '#cccccc', '#c94fc4'] }),
         this.S('Vibrance', ['vibrance'], -100, 100, { gradient: ['#777777', '#a98bb8', '#d7508e'] }),
-        this.S('Bão hoà', ['saturation'], -100, 100, { gradient: ['#777777', '#cf9a52', '#e2403a'] })),
+        this.S('Bão hoà', ['saturation'], -100, 100, { gradient: ['#777777', '#cf9a52', '#e2403a'] }),
+        this.S('Độ sâu màu', ['depth'], -100, 100, { gradient: ['#e8c9c9', '#c0605a', '#6e1410'] }),
+        this.S('Đỏ đầm (phim)', ['film_color'], 0, 100, { gradient: ['#f08a80', '#c2302a', '#7a0f0c'] }),
+        hint('Độ sâu màu: màu càng đậm càng sẫm và đầm lại kiểu phim (âm = sáng, nhạt phấn). Đỏ đầm: đỏ đậm mà sáng (áo dài, phông đỏ) sẫm lại như Capture One, giữ nếp vải; style "Gu Capture One" đặt 40.')),
       this.sec('Tông sáng', { auto: auto('tone'), reset: reset(['exposure'], ['contrast'], ['brightness'], ['highlights'], ['shadows'], ['whites'], ['blacks']) }).add(
         this.S('Phơi sáng', ['exposure'], -5, 5, { step: 0.01, dec: 2 }),
         this.S('Tương phản', ['contrast'], -100, 100),
@@ -364,14 +371,14 @@ export class Panels {
     const curve = new CurveEditor({ get: (ch) => app.get(['curve', ch]), set: (ch, pts, live) => app.set(['curve', ch], pts, live),
       begin: () => app.begin('Đường cong'), end: () => app.end(), hist: () => app.hist });
     this.curve = curve;
-    const chBtns = h('div', { class: 'grid4' });
-    for (const [ch, t] of [['rgb', 'RGB'], ['r', 'Đỏ'], ['g', 'Lục'], ['b', 'Lam']])
+    const chBtns = h('div', { class: 'grid4', style: 'grid-template-columns:repeat(5,1fr)' });
+    for (const [ch, t] of [['rgb', 'RGB'], ['luma', 'Luma'], ['r', 'Đỏ'], ['g', 'Lục'], ['b', 'Lam']])
       chBtns.append(h('button', { 'data-c': ch, onclick: () => { curve.setChannel(ch); this.sync(); } }, t));
     const gridSel = select('Lưới', [['4', '4×4'], ['8', '8×8'], ['16', '16×16']], () => curve.div, (v) => { curve.div = +v; curve.draw(); });
     this.W({ sync: () => { for (const b of chBtns.children) b.classList.toggle('sel', b.dataset.c === curve.ch); gridSel.sync(); curve.draw(); } });
     this.page('curve',
       this.sec('Đường cong (Curve)', { auto: auto('curve'), reset: reset(['curve']) }).add(chBtns, gridSel.el, curve.el,
-        hint('Chạm để thêm điểm, kéo để chỉnh, chạm đúp vào điểm (hoặc kéo ra ngoài khung) để xoá, chạm đúp chỗ trống để đặt lại kênh.')));
+        hint('Chạm để thêm điểm, kéo để chỉnh, chạm đúp vào điểm (hoặc kéo ra ngoài khung) để xoá, chạm đúp chỗ trống để đặt lại kênh. Luma (như Capture One): chỉ đổi sáng tối, giữ sắc độ và độ đậm màu — nâng trung tông mà da, vải không bạc màu.')));
 
     // ------------------------------------------------------------ Chi tiết
     const noNrl = () => (app.get(['nr_lum']) ? '' : 'Tăng "Độ sáng" khử nhiễu trước thì thanh này mới có tác dụng');

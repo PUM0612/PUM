@@ -46,7 +46,11 @@ export function defaultSettings() {
     exposure: 0.0, contrast: 0.0, brightness: 0.0,
     highlights: 0.0, shadows: 0.0, whites: 0.0, blacks: 0.0,
     clarity: 0.0, dehaze: 0.0, vibrance: 0.0, saturation: 0.0,
-    curve: { rgb: ident(), r: ident(), g: ident(), b: ident() },
+    depth: 0.0,                 // Độ sâu màu: màu đậm thì sẫm + đầm lại (kiểu phim), âm = nhạt phấn
+    film_color: 0.0,            // Đỏ đầm (phim): đỏ đậm mà SÁNG sẫm lại về đỉnh gam, giữ độ đậm
+    color_ver: 2,               // 2 = dựng màu trong OkLCh (PUM 1.1.2)
+    tone_ver: 2,                // 2 = Highlights âm là "vai phim" (PUM 1.1.2)
+    curve: { rgb: ident(), r: ident(), g: ident(), b: ident(), luma: ident() },
     color,
     color_adv: [],
     skin: { hue: 0.0, sat: 0.0, lum: 0.0, uni_hue: 0.0, uni_sat: 0.0, uni_lum: 0.0 },
@@ -102,11 +106,41 @@ function deepUpdate(dst, src) {
   return dst;
 }
 
+// so sánh sâu kiểu Python (==): số 0 và 0.0 bằng nhau, không tuỳ thứ tự khoá
+function deepEq(a, b) {
+  if (a === b) return true;
+  if (typeof a === 'number' && typeof b === 'number') return a === b;
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    return a.every((v, i) => deepEq(v, b[i]));
+  }
+  if (isObj(a) && isObj(b)) {
+    const ka = Object.keys(a), kb = Object.keys(b);
+    return ka.length === kb.length && ka.every((k) => k in b && deepEq(a[k], b[k]));
+  }
+  return false;
+}
+const TONE_KEYS_V = ['temp', 'tint', 'exposure', 'contrast', 'brightness', 'highlights', 'shadows', 'whites', 'blacks',
+  'clarity', 'dehaze', 'vibrance', 'saturation', 'depth', 'curve', 'color', 'color_adv', 'skin', 'grading', 'calib'];
+
 export function mergeSettings(s) {
   const base = defaultSettings();
-  if (s) {
+  if (s && Object.keys(s).length) {
     deepUpdate(base, s);
     base.layers = (base.layers || []).map((ly) => deepUpdate(newLayer(), ly));
+    if (!('color_ver' in s)) {
+      // ảnh chỉnh từ bản trước (màu dựng theo HSV): đã có chỉnh màu thì giữ cách dựng cũ để ảnh không đổi
+      const old = !!(base.vibrance || base.saturation ||
+        Object.values(base.color).some((v) => v.some((x) => Math.abs(x) > 1e-6)) ||
+        Object.values(base.skin).some((v) => Math.abs(v) > 1e-6));
+      base.color_ver = old ? 1 : 2;
+    }
+    if (!('tone_ver' in s)) {
+      // ảnh đã chỉnh tông / màu ở bản trước: giữ cách dựng cũ (Highlights kiểu cũ, cuộn vùng sáng từng kênh)
+      const d0 = defaultSettings();
+      const old = TONE_KEYS_V.some((k) => !deepEq(base[k], d0[k])) || !!(base.layers && base.layers.length);
+      base.tone_ver = old ? 1 : 2;
+    }
   }
   return base;
 }
@@ -141,6 +175,8 @@ export function blendStyle(current, style, strength = 1.0, includeRetouch = fals
       for (const [ck, v] of Object.entries(sv)) cur.calib[ck] = v * k;
     } else if (typeof sv === 'number' && key in d) cur[key] = mix(d[key], sv);
   }
+  // style lưu từ bản trước (chưa có tone_ver) mà có kéo Highlights xuống: giữ cách kéo cũ cho đúng ý của style
+  if (k > 0 && !('tone_ver' in style) && typeof style.highlights === 'number' && style.highlights < 0) cur.tone_ver = 1;
   return cur;
 }
 
@@ -164,6 +200,20 @@ export const BUILTIN_STYLES = {
     curve: { rgb: [[0, 0], [0.25, 0.2], [0.75, 0.82], [1, 1]], r: [[0, 0], [1, 1]], g: [[0, 0], [1, 1]], b: [[0, 0], [1, 1]] } },
   'Da chân dung': { skin: { uni_hue: 45, uni_sat: 35, uni_lum: 30, lum: 8, hue: 0, sat: -5 }, clarity: -5, vibrance: 8 },
   'Xanh mát': { temp: -15, tint: -3, contrast: 10, vibrance: 15, color: { blue: [-10, 20, -5], aqua: [0, 15, 0] } },
+  // PUM 1.1.2 (library.BUILTIN_STYLES, bản 5): học từ 85 ảnh "Bảng điều khiển Capture One"; dùng sau Cân bằng trắng
+  // Tự động + Tự động. Đường cong Luma (vùng tối đen sâu như C1), Bão hoà +6, da giữ độ đậm và bớt vàng, Đỏ đầm 40.
+  'Gu Capture One (Cơ bản)': {
+    color_ver: 2, clarity: 10, film_color: 40, saturation: 6.0,
+    curve: {
+      rgb: [[0, 0], [1, 1]], g: [[0, 0], [1, 1]],
+      r: [[0, 0], [0.5, 0.509], [1, 1]], b: [[0, 0], [0.5, 0.483], [1, 1]],
+      luma: [[0.0, 0.0], [0.03125, 0.027], [0.0625, 0.054], [0.09375, 0.0775], [0.125, 0.0938],
+        [0.15625, 0.1614], [0.1875, 0.2248], [0.21875, 0.2727], [0.25, 0.317], [0.3125, 0.4032],
+        [0.375, 0.4832], [0.4375, 0.5557], [0.5, 0.6221], [0.5625, 0.6848], [0.625, 0.7429],
+        [0.6875, 0.7924], [0.75, 0.833], [0.8125, 0.8674], [0.875, 0.9014], [0.9375, 0.9519], [1.0, 1.0]] },
+    color: { red: [1, 12, -7], orange: [-26, -37, 0], yellow: [3, 18, -3], green: [5, 11, -2],
+      aqua: [8, 2, -8], blue: [8, 40, 17], purple: [0, 5, 40], magenta: [1, 1, 12] },
+    skin: { hue: -4.0, sat: -5.0 } },   // chỉ 2 khoá này: không xoá "đều màu da" người dùng đã đặt
 };
 
 export function cropRatio(name) {

@@ -18,7 +18,12 @@ export const N = 512;                 // cỡ vào / ra cố định của mô h
 export const REF_SIDE = 2000;         // cạnh dài độ phân giải tham chiếu (= PREVIEW_SIDE của PUM máy tính)
 const MIN_CTX = 320;                  // khung cắt tối thiểu (điểm ảnh tham chiếu)
 const CTX_K = 1.7;                    // khung cắt = 1,7 x cạnh lớn của vùng tô + 64 px tham chiếu
-export const VARIANTS = [1.0, 1.45, 0.8, 2.0];   // "Thử cách khác": đổi lượng bối cảnh đưa vào mô hình
+// "Thử cách khác" (PUM 1.1.2): [lượng bối cảnh đưa vào AI, AI dùng: 'auto' = theo cỡ vật, 'alt' = AI còn lại].
+// PUM máy tính có 2 AI (LaMa + RORem trên card đồ hoạ); iPhone chỉ có LaMa nên 'alt' = như 'auto' (app bỏ qua khi bấm).
+export const VARIANTS = [[1.0, 'auto'], [1.45, 'auto'], [1.0, 'alt'], [0.8, 'auto']];
+// vật dày từ chừng này (điểm ảnh tham chiếu) trở lên: PUM máy tính dùng RORem nếu có card — iPhone luôn dùng LaMa
+export const GPU_MIN_S = 90;
+export const chooseAi = () => 'lama';
 const PATCH = 6;                      // cỡ mảnh (điểm ảnh của nền AI) khi ghép chi tiết cao tần
 const DETAIL_BAND = 6.0;              // chi tiết ghép thêm: chỉ phần mịn hơn chừng này điểm ảnh (hạt, sợi vải)
 const DETAIL_MIN = 3.5;               // ... và ít nhất tới cỡ này (nền AI mịn hơn ảnh thật cả ở độ phân giải của nó)
@@ -116,7 +121,9 @@ export function plan(a, w, h) {
   const [bx0, by0, bx1, by1] = areaBBox(a, w, h);
   const k = REF_SIDE / Math.max(w, h);
   const vi = Math.trunc(Number(a.v || 0)) % VARIANTS.length;
-  const vr = VARIANTS[vi < 0 ? vi + VARIANTS.length : vi];
+  const vr = VARIANTS[vi < 0 ? vi + VARIANTS.length : vi][0];
+  // AI đã chọn lúc tô (lưu trong vùng, PUM máy tính), không có thì tự chọn; không có RORem nên 'alt' không đổi AI
+  const eng = a.ai || chooseAi(a, w, h);
   const bw = (bx1 - bx0) * k, bh = (by1 - by0) * k;
   const s_ = Math.min(bw, bh), l_ = Math.max(bw, bh);
   const S1 = Math.max(MIN_CTX, CTX_K * l_ + 64.0) * vr;
@@ -129,7 +136,7 @@ export function plan(a, w, h) {
     const y0 = Math.min(Math.max(ccy - sh / 2.0, 0.0), h - sh);
     return [x0 / w, y0 / h, (x0 + sw) / w, (y0 + sh) / h];
   };
-  if (!(S1 > TILE_MIN_S && S1 > 1.5 * T && s_ * N / S1 > 40)) return [{ rect: sq(cx, cy, S1), band: null }];
+  if (!(S1 > TILE_MIN_S && S1 > 1.5 * T && s_ * N / S1 > 40)) return [{ rect: sq(cx, cy, S1), band: null, eng }];
   const axis = bh >= bw ? 1 : 0;
   const a0 = axis ? by0 : bx0, a1 = axis ? by1 : bx1;
   const m = (T - s_) / 2.0 / k;
@@ -137,7 +144,7 @@ export function plan(a, w, h) {
   const span = (a1 - a0) + 2 * m;
   let n = Math.trunc(Math.ceil(Math.max(0.0, span - Tc) / (0.65 * Tc))) + 1;
   if (n > MAX_TILES) { Tc = span / (1 + 0.65 * (MAX_TILES - 1)); n = MAX_TILES; }
-  if (n <= 1) return [{ rect: sq(cx, cy, S1), band: null }];
+  if (n <= 1) return [{ rect: sq(cx, cy, S1), band: null, eng }];
   const first = a0 - m + Tc / 2, last = a1 + m - Tc / 2;
   const cs = [];
   for (let i = 0; i < n; i++) cs.push(first + (last - first) * i / (n - 1));
@@ -147,7 +154,7 @@ export function plan(a, w, h) {
     const c = cs[i];
     const lo = i === 0 ? -1.0 : (cs[i - 1] + c) / 2 / dim;
     const hi = i === n - 1 ? 2.0 : (c + cs[i + 1]) / 2 / dim;
-    tiles.push({ rect: axis ? sq(cx, c, Tc * k) : sq(c, cy, Tc * k), band: [axis, lo, hi] });
+    tiles.push({ rect: axis ? sq(cx, c, Tc * k) : sq(c, cy, Tc * k), band: [axis, lo, hi], eng });
   }
   return tiles;
 }
@@ -198,7 +205,8 @@ export function cacheKey(photo, rt, i, w, h) {
   }
   const me = {};
   for (const k of Object.keys(a)) if (!['opacity', 'enabled', 'fill', 'cands'].includes(k)) me[k] = a[k];
-  const s = stable([KEY_TAG, photo, me, deps]);
+  const engs = plan(a, w, h).map((t) => t.eng);      // khoá theo AI dùng (như PUM máy tính 1.1.2)
+  const s = stable([KEY_TAG, engs, photo, me, deps]);
   return cyrb53(s, 1) + cyrb53(s, 7);
 }
 
@@ -552,7 +560,8 @@ export function detail(C, F, hole, kx, ky, P = PATCH) {
     }
     const sdR = rsd(vr), sdD = rsd(vd), sdF = rsd(vf);
     if (sdD > 1e-6) {
-      const g = f32(Math.min(1.8, Math.max(0.6, Math.sqrt(Math.max(sdR * sdR - sdF * sdF, 0.0)) / sdD)));
+      // nền AI đã đủ hạt thì không thêm (PUM 1.1.2: cận dưới 0,6 -> 0); nền trơn (LaMa) thì bù phần thiếu
+      const g = f32(Math.min(1.8, Math.max(0.0, Math.sqrt(Math.max(sdR * sdR - sdF * sdF, 0.0)) / sdD)));
       for (let i = 0; i < D.length; i++) D[i] *= g;
     }
   }

@@ -58,9 +58,10 @@ const pick = (s, keys) => keys.map((k) => s[k]);
 const STAGES = [
   // xoá vật thể: kết quả AI mới về (XV.state.epoch tăng) thì dựng lại bước retouch
   { name: 'retouch', key: (s) => J(s.retouch) + '#' + XV.state.epoch, run: (img, s, c) => applyRetouch(img, s.retouch, c) },
-  { name: 'tone', key: (s) => J([s.lens.vig_corr, s.calib, s.curve, pick(s, ['temp', 'tint', 'exposure', 'dehaze', 'highlights', 'shadows', 'whites', 'blacks', 'contrast', 'brightness', 'clarity'])]),
+  { name: 'tone', key: (s) => J([s.lens.vig_corr, s.calib, s.curve, pick(s, ['temp', 'tint', 'exposure', 'dehaze', 'highlights', 'shadows', 'whites', 'blacks', 'contrast', 'brightness', 'clarity', 'tone_ver'])]),
     run: (img, s, c) => E.tone(E.vigCorr(img, s, c.roi), s) },
-  { name: 'color', key: (s) => J([s.color, s.color_adv, s._cadv_show ?? null, s.skin, s.vibrance, s.saturation]), run: (img, s) => E.color(img, s) },
+  { name: 'color', key: (s) => J([s.color, s.color_adv, s._cadv_show ?? null, s.skin, s.vibrance, s.saturation, s.depth, s.film_color, s.color_ver]),
+    run: (img, s) => E.filmColor(E.color(img, s), s) },
   { name: 'grading', key: (s) => J(s.grading), run: (img, s) => E.grading(img, s.grading) },
   { name: 'layers', key: (s) => J(s.layers), run: (img, s, c) => E.applyLayers(img, s, c) },
   { name: 'detail', key: (s) => J(pick(s, ['nr_lum', 'nr_lum_detail', 'nr_lum_contrast', 'nr_color', 'nr_color_detail', 'nr_color_smooth', 'sharpen', 'sharpen_radius'])),
@@ -218,7 +219,7 @@ self.onmessage = async (ev) => {
     } else if (m.type === 'auto') {
       const b = bases[m.id];
       const s = mergeSettings(m.settings);
-      const res = A.autoSection(m.key, b.full, s, { k: b.fullW / b.full.w, layer: m.layer, personFn: b.personFn, faces: b.faces });
+      const res = A.autoSection(m.key, b.full, s, { k: b.fullW / b.full.w, layer: m.layer, personFn: b.personFn, faces: b.faces, iso: m.iso ?? null });
       self.postMessage({ type: 'auto', req: m.req, res });
     } else if (m.type === 'area_sources') {
       // tự tìm nguồn cho vùng tô mới, trên ảnh đã áp các retouch trước đó

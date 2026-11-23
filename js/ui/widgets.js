@@ -118,8 +118,9 @@ export class ColorWheel {
   }
 }
 
-const CH_COL = { rgb: '#e6e6e6', r: '#ff5a50', g: '#4ccf5a', b: '#4f8dff' };
-const CH_BG = { rgb: ['#151517', '#2a2a2e'], r: ['#1c1213', '#3a1f1f'], g: ['#121a13', '#1f3522'], b: ['#12151c', '#1f2a40'] };
+// luma (PUM 1.1.2): kênh Độ sáng như Capture One — chỉ đổi sáng tối, giữ sắc độ và độ đậm màu
+const CH_COL = { rgb: '#e6e6e6', luma: '#f0c85a', r: '#ff5a50', g: '#4ccf5a', b: '#4f8dff' };
+const CH_BG = { rgb: ['#151517', '#2a2a2e'], luma: ['#1a1810', '#36301c'], r: ['#1c1213', '#3a1f1f'], g: ['#121a13', '#1f3522'], b: ['#12151c', '#1f2a40'] };
 
 export class CurveEditor {
   // o: { get: (ch) => pts, set: (ch, pts, live), begin, end, hist: () => Uint32Array(1024) | null }
@@ -183,7 +184,7 @@ export class CurveEditor {
     c.fillStyle = bg; c.fillRect(0, 0, w, hh);
     const hist = this.o.hist && this.o.hist();
     if (hist) {
-      const off = { rgb: 768, r: 0, g: 256, b: 512 }[this.ch];
+      const off = { rgb: 768, luma: 768, r: 0, g: 256, b: 512 }[this.ch];
       let mx = 1; for (let i = 0; i < 256; i++) mx = Math.max(mx, hist[off + i]);
       c.fillStyle = 'rgba(255,255,255,.10)'; c.beginPath(); c.moveTo(0, hh);
       for (let i = 0; i < 256; i++) c.lineTo(i / 255 * w, hh - Math.sqrt(hist[off + i] / mx) * hh * 0.9);
